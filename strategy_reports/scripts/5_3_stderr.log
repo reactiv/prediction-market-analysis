@@ -1,0 +1,17 @@
+[info] Built resolution table for 763168 tokens
+[info] Computing per-address features from all trades...
+[info] Address features computed in 181.2s, 1,955,246 addresses
+[info] Computing resolved buyer stats per address...
+[info] Buyer stats computed in 194.5s, 1,926,821 addresses with resolved trades
+[info] Merged: 1,955,246 addresses total, 1,926,821 with resolved buyer data
+[info] Classification thresholds:
+  median avg_amount = $25.16
+  p95 avg_amount    = $511.00
+  p99 n_trades      = 2504
+[info] Cluster 'Market Maker': 33,858 addresses
+[info] Cluster 'Retail': 13,754 addresses
+[info] Cluster 'Whale': 22,865 addresses
+[info] Cluster 'Bot/HFT': 19,553 addresses
+[info] Cluster 'Other': 1,865,216 addresses
+[info] Saved strategy_reports/figures/5_3_cluster_composition.png
+[info] Saved strategy_reports/figures/5_3_cluster_excess_returns.png

@@ -1,0 +1,22 @@
+Loading trade data with time-to-expiry buckets...
+  Rows (bucket x price combos with >=100 trades): 598
+  Time buckets found: ['0-1h', '1-3d', '1-6h', '3-7d', '6-24h', '7d+']
+Computing calibration curves...
+  0-1h: 20 price bins
+  1-6h: 20 price bins
+  6-24h: 20 price bins
+  1-3d: 20 price bins
+  3-7d: 20 price bins
+  7d+: 20 price bins
+Computing MAE per time bucket...
+  0-1h: MAE = 1.41 pp  (18,789,022 trades)
+  1-6h: MAE = 1.69 pp  (24,913,297 trades)
+  6-24h: MAE = 2.68 pp  (9,937,585 trades)
+  1-3d: MAE = 3.19 pp  (4,538,014 trades)
+  3-7d: MAE = 3.29 pp  (2,773,904 trades)
+  7d+: MAE = 4.46 pp  (6,793,532 trades)
+Plotting calibration curves...
+Saved /Users/james/polybot/prediction-market-analysis/strategy_reports/figures/3_2_calibration_by_time_bucket.png
+Plotting MAE bar chart...
+Saved /Users/james/polybot/prediction-market-analysis/strategy_reports/figures/3_2_mae_by_time_bucket.png
+Building summary...

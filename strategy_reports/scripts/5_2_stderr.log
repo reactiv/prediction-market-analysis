@@ -1,0 +1,7 @@
+[info] Built resolution table for 763332 tokens
+[info] Querying trades (this may take several minutes)...
+[info] Running main query...
+[info] Query complete in 64.7s, 387,996,555 buyer trades
+[info] Percentiles: p50=5.00, p90=89.24, p95=200.00, p99=1231.23 USDC
+[info] Saved strategy_reports/figures/5_2_whale_win_rate.png
+[info] Saved strategy_reports/figures/5_2_whale_excess_return.png

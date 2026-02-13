@@ -1,0 +1,15 @@
+Loading data...
+  Price-regime rows: 264
+  Regime summary:
+  volume_regime  regime_order  n_markets  total_trades  total_contracts
+0           Low             1     202173      202173.0     1.336584e+08
+1        Medium             2     167681     1065569.0     2.079552e+08
+2          High             3     184369    66493664.0     1.688899e+10
+  Percentile thresholds: p33=1, p67=16
+  MAE by regime:
+  volume_regime    mae_pp
+0           Low  2.994263
+1        Medium  4.961869
+2          High  1.589226
+Saved /Users/james/polybot/prediction-market-analysis/strategy_reports/figures/3_4_calibration_by_volume_regime.png
+Saved /Users/james/polybot/prediction-market-analysis/strategy_reports/figures/3_4_mae_by_regime.png

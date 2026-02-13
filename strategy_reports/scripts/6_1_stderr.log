@@ -1,0 +1,45 @@
+[info] Building resolved market lookup...
+[info] 7,314,386 resolved market rows
+[info] Computing daily volumes per market...
+[info] 1,211,988 market-days computed
+[info] Computing market averages and classifying spike days...
+[info] 70,194 markets with >= 3 trading days
+[info] Day classification summary:
+  day_type  n_days  total_trades  total_contracts  avg_daily_trades
+0   normal  612421    22315349.0     5.364460e+09         36.437923
+1    spike   36476    25933308.0     9.049982e+09        710.969076
+[info] Joining trades with spike classification and resolution...
+[info] 48,245,905 tagged trades
+[info] Computing calibration curves...
+[info] Calibration data:
+   day_type  bucket  avg_price  win_rate  win_rate_unweighted  total_contracts  n_trades
+0    normal     1.0     0.0489  0.020142             0.028803     1.160348e+09   2785508
+1    normal     2.0     0.1555  0.108319             0.127175     4.428286e+08   2030411
+2    normal     3.0     0.2556  0.228847             0.239693     4.098579e+08   2137560
+3    normal     4.0     0.3561  0.363125             0.370481     4.513559e+08   2371598
+4    normal     5.0     0.4572  0.410161             0.434557     4.765224e+08   2492361
+5    normal     6.0     0.5551  0.577455             0.552011     5.291199e+08   2517107
+6    normal     7.0     0.6540  0.635934             0.619519     4.573647e+08   2304023
+7    normal     8.0     0.7552  0.755645             0.742760     3.854658e+08   1960305
+8    normal     9.0     0.8555  0.892672             0.863068     3.980927e+08   1770395
+9    normal    10.0     0.9548  0.973598             0.955056     6.497075e+08   1943372
+10    spike     1.0     0.0530  0.030943             0.036964     1.291896e+09   2859500
+11    spike     2.0     0.1555  0.139150             0.144110     8.099846e+08   2564377
+12    spike     3.0     0.2554  0.260134             0.246194     8.019968e+08   2746134
+13    spike     4.0     0.3558  0.343271             0.344524     8.740273e+08   2974121
+14    spike     5.0     0.4563  0.408679             0.426805     9.893492e+08   3122535
+15    spike     6.0     0.5543  0.579204             0.563154     1.026185e+09   3077843
+16    spike     7.0     0.6536  0.638008             0.636538     8.390155e+08   2604168
+17    spike     8.0     0.7554  0.752883             0.752565     7.475313e+08   2204504
+18    spike     9.0     0.8551  0.851051             0.846903     7.576149e+08   1953850
+19    spike    10.0     0.9505  0.956198             0.947285     9.123294e+08   1826225
+[info] Computing overall statistics...
+[info] Overall stats:
+  day_type  n_trades   n_contracts  win_rate  avg_price  excess_return  win_rate_unweighted  avg_price_unweighted
+0    spike  25933257  9.049930e+09   0.47241   0.481167      -0.008758             0.460542              0.471007
+1   normal  22312648  5.360665e+09   0.44772   0.456165      -0.008445             0.469214              0.481213
+[info] Creating calibration figure...
+[info] Saved strategy_reports/figures/6_1_spike_vs_normal_calibration.png
+[info] Creating excess returns figure...
+[info] Saved strategy_reports/figures/6_1_spike_excess_returns.png
+[info] Done in 5.0s

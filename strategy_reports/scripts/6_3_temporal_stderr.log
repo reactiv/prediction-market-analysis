@@ -1,0 +1,22 @@
+[info] Running quarterly YES bias query...
+[info] Query done in 3.1s, 18 quarters
+  2021-Q3       YES=    28,536  NO=    29,779  ratio=0.96  yes_ex=-3.78pp  no_ex=+11.25pp  gap=-15.02pp
+  2021-Q4       YES=    47,380  NO=    47,715  ratio=0.99  yes_ex=+1.68pp  no_ex=+4.69pp  gap=-3.00pp
+  2022-Q1       YES=    63,800  NO=    61,346  ratio=1.04  yes_ex=+2.92pp  no_ex=+5.38pp  gap=-2.47pp
+  2022-Q2       YES=   112,734  NO=   117,124  ratio=0.96  yes_ex=+2.64pp  no_ex=+3.43pp  gap=-0.80pp
+  2022-Q3       YES=   196,974  NO=   204,882  ratio=0.96  yes_ex=+0.97pp  no_ex=+2.31pp  gap=-1.34pp
+  2022-Q4       YES=   137,661  NO=   126,117  ratio=1.09  yes_ex=-0.67pp  no_ex=+2.56pp  gap=-3.22pp
+  2023-Q1       YES=   146,978  NO=   151,225  ratio=0.97  yes_ex=+0.79pp  no_ex=+1.05pp  gap=-0.26pp
+  2023-Q2       YES=   266,141  NO=   322,215  ratio=0.83  yes_ex=+0.74pp  no_ex=+1.08pp  gap=-0.34pp
+  2023-Q3       YES=   220,750  NO=   233,554  ratio=0.95  yes_ex=-0.41pp  no_ex=+2.38pp  gap=-2.79pp
+  2023-Q4       YES=   178,973  NO=   190,014  ratio=0.94  yes_ex=+0.25pp  no_ex=-0.22pp  gap=+0.47pp
+  2024-Q1       YES=   269,220  NO=   288,443  ratio=0.93  yes_ex=+2.26pp  no_ex=-1.54pp  gap=+3.80pp
+  2024-Q2       YES=   191,264  NO=   220,400  ratio=0.87  yes_ex=-2.89pp  no_ex=+1.11pp  gap=-4.00pp
+  2024-Q3       YES=   179,945  NO=   168,162  ratio=1.07  yes_ex=-1.32pp  no_ex=-0.02pp  gap=-1.29pp
+  2024-Q4       YES= 2,322,317  NO= 1,746,251  ratio=1.33  yes_ex=-1.02pp  no_ex=-1.97pp  gap=+0.95pp
+  2025-Q1       YES= 3,571,327  NO= 2,245,652  ratio=1.59  yes_ex=-2.14pp  no_ex=+0.38pp  gap=-2.52pp
+  2025-Q2       YES= 5,075,777  NO= 2,600,429  ratio=1.95  yes_ex=-1.29pp  no_ex=-0.76pp  gap=-0.53pp
+  2025-Q3       YES=11,827,608  NO= 4,470,059  ratio=2.65  yes_ex=-1.04pp  no_ex=-1.43pp  gap=+0.39pp
+  2025-Q4       YES=21,955,310  NO= 7,745,343  ratio=2.83  yes_ex=-1.44pp  no_ex=-1.03pp  gap=-0.41pp
+[info] Creating temporal figure...
+[info] Saved /Users/james/polybot/prediction-market-analysis/strategy_reports/figures/6_3_yes_bias_temporal.png

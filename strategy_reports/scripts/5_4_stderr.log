@@ -1,0 +1,42 @@
+Discovering contract types...
+  Found contract types: ['CTF Exchange', 'NegRisk CTF Exchange']
+Building token resolution table...
+  Resolved 763168 tokens
+
+--- Volume Statistics ---
+Querying volume stats (scanning all trades)...
+              _contract  trade_count  total_cash_volume  avg_cash_per_trade  median_cash_per_trade  distinct_tokens
+0          CTF Exchange    264516032       1.943576e+16        7.347668e+07              4887000.0           432393
+1  NegRisk CTF Exchange    140023968       1.554148e+16        1.109915e+08              6169600.0           158790
+
+--- Trade Size Distributions ---
+Querying trade size distributions...
+               _contract size_bucket  bucket_order        cnt
+0           CTF Exchange        < $1             0   40083017
+1           CTF Exchange       $1-10             1  138477012
+2           CTF Exchange     $10-100             2   67290706
+3           CTF Exchange     $100-1K             3   15930035
+4           CTF Exchange     $1K-10K             4    2554601
+5           CTF Exchange       $10K+             5     180661
+6   NegRisk CTF Exchange        < $1             0   38460313
+7   NegRisk CTF Exchange       $1-10             1   42049061
+8   NegRisk CTF Exchange     $10-100             2   43753227
+9   NegRisk CTF Exchange     $100-1K             3   13532568
+10  NegRisk CTF Exchange     $1K-10K             4    2088731
+11  NegRisk CTF Exchange       $10K+             5     140068
+
+--- Calibration by Contract Type ---
+Querying calibration by contract type (this is the slow one)...
+  CTF Exchange: {'brier_score': np.float64(0.1706), 'ece': np.float64(0.0047), 'log_loss': np.float64(0.5043), 'total_resolved_trades': 250276562}
+  NegRisk CTF Exchange: {'brier_score': np.float64(0.0991), 'ece': np.float64(0.0356), 'log_loss': np.float64(0.3156), 'total_resolved_trades': 94265688}
+
+--- Generating Figures ---
+/Users/james/polybot/prediction-market-analysis/strategy_reports/scripts/5_4_contract_type_segmentation.py:252: UserWarning: set_ticklabels() should only be used with a fixed number of ticks, i.e. after set_ticks() or using a FixedLocator.
+  ax1.set_xticklabels(contract_types, rotation=15, ha="right", fontsize=9)
+/Users/james/polybot/prediction-market-analysis/strategy_reports/scripts/5_4_contract_type_segmentation.py:264: UserWarning: set_ticklabels() should only be used with a fixed number of ticks, i.e. after set_ticks() or using a FixedLocator.
+  ax2.set_xticklabels(contract_types, rotation=15, ha="right", fontsize=9)
+  Saved /Users/james/polybot/prediction-market-analysis/strategy_reports/figures/5_4_volume_by_contract_type.png
+  Saved /Users/james/polybot/prediction-market-analysis/strategy_reports/figures/5_4_trade_size_by_contract_type.png
+  Saved /Users/james/polybot/prediction-market-analysis/strategy_reports/figures/5_4_calibration_by_contract_type.png
+
+Done.

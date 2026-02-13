@@ -1,0 +1,9 @@
+[info] Built resolution table for 763168 tokens
+[info] Computing Period 1 stats (blocks < 61000000)...
+[info] Period 1: 17699 qualifying addresses
+[info] Computing Period 2 stats (blocks >= 61000000)...
+[info] Period 2: 758861 qualifying addresses
+[info] Addresses present in both periods: 10276
+[info] Correlation(P1, P2 excess return) = 0.2249
+[info] Saved figure to strategy_reports/figures/5_1_smart_money_temporal.png
+[info] Complete in 62.6s
