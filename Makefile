@@ -1,4 +1,4 @@
-.PHONY: analyze run index package lint format setup
+.PHONY: analyze run index transform package lint format setup
 
 RUN = uv run main.py
 
@@ -10,6 +10,12 @@ run:
 
 index:
 	$(RUN) index
+
+transform:
+	$(RUN) transform
+
+transform-all:
+	$(RUN) transform all
 
 package:
 	$(RUN) package

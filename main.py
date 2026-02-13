@@ -9,6 +9,7 @@ from src.common.analysis import Analysis
 from src.common.indexer import Indexer
 from src.common.util import package_data
 from src.common.util.strings import snake_to_title
+from src.transforms._base import Transform
 
 
 def analyze(name: str | None = None):
@@ -126,6 +127,78 @@ def index():
     print("\nIndexer complete.")
 
 
+def transform(name: str | None = None, force: bool = False):
+    """Run a data transform by name or show interactive menu."""
+    transforms = Transform.load()
+
+    if not transforms:
+        print("No transforms found in src/transforms/")
+        return
+
+    if name:
+        if name == "all":
+            print("\nRunning all transforms (respecting dependencies)...\n")
+            completed = set()
+            remaining = list(transforms)
+            while remaining:
+                runnable = [
+                    t for t in remaining if all(d in completed for d in t().dependencies)
+                ]
+                if not runnable:
+                    print("Cannot proceed: unresolvable dependencies")
+                    for t in remaining:
+                        inst = t()
+                        print(f"  {inst.name}: blocked by {inst.dependencies}")
+                    sys.exit(1)
+                for transform_cls in runnable:
+                    instance = transform_cls()
+                    instance.execute(force=force)
+                    completed.add(instance.name)
+                    remaining.remove(transform_cls)
+            print("\nAll transforms complete.")
+            return
+
+        for transform_cls in transforms:
+            instance = transform_cls()
+            if instance.name == name:
+                instance.execute(force=force)
+                return
+
+        print(f"Transform '{name}' not found. Available transforms:")
+        for transform_cls in transforms:
+            instance = transform_cls()
+            deps = f" (depends on: {', '.join(instance.dependencies)})" if instance.dependencies else ""
+            print(f"  - {instance.name}{deps}")
+        sys.exit(1)
+
+    # Interactive menu mode
+    options = ["[All] Run all transforms"]
+    for transform_cls in transforms:
+        instance = transform_cls()
+        deps = f" [deps: {', '.join(instance.dependencies)}]" if instance.dependencies else ""
+        options.append(f"{snake_to_title(instance.name)}: {instance.description}{deps}")
+    options.append("[Exit]")
+
+    menu = TerminalMenu(
+        options,
+        title="Select a transform to run (use arrow keys):",
+        cycle_cursor=True,
+        clear_screen=False,
+    )
+    choice = menu.show()
+
+    if choice is None or choice == len(options) - 1:
+        print("Exiting.")
+        return
+
+    if choice == 0:
+        transform("all", force=force)
+    else:
+        transform_cls = transforms[choice - 1]
+        instance = transform_cls()
+        instance.execute(force=force)
+
+
 def package():
     """Package the data directory into a zstd-compressed tar archive."""
     success = package_data()
@@ -135,7 +208,7 @@ def package():
 def main():
     if len(sys.argv) < 2:
         print("\nUsage: uv run main.py <command>")
-        print("Commands: analyze, index, package")
+        print("Commands: analyze, index, transform, package")
         sys.exit(0)
 
     command = sys.argv[1]
@@ -149,12 +222,19 @@ def main():
         index()
         sys.exit(0)
 
+    if command == "transform":
+        force = "--force" in sys.argv
+        args = [a for a in sys.argv[2:] if a != "--force"]
+        name = args[0] if args else None
+        transform(name, force=force)
+        sys.exit(0)
+
     if command == "package":
         package()
         sys.exit(0)
 
     print(f"Unknown command: {command}")
-    print("Commands: analyze, index, package")
+    print("Commands: analyze, index, transform, package")
     sys.exit(1)
 
 
