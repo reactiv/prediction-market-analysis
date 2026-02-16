@@ -24,7 +24,7 @@ The top tercile accounts for 98.1% of all trades. Polymarket has similar concent
 
 ## T1: Trade-Level Enrichment + Conditional OHLCV
 
-**Status:** `[ ]` Not started
+**Status:** `[x]` Complete — Layer A completed 2026-02-13 (476.7M enriched trades), Layer B completed 2026-02-16 (1.6B gap-filled bars across 556K qualifying markets)
 
 **What:** Two-layer transform. **Layer A** enriches every raw trade with derived sequential fields (works at any density). **Layer B** resamples into OHLCV bars only for markets exceeding a trade-density threshold.
 
@@ -36,20 +36,20 @@ The top tercile accounts for 98.1% of all trades. Polymarket has similar concent
 - Polymarket: `data/polymarket/trades/*.parquet` — fields: `maker_asset_id`, `taker_asset_id`, `maker_amount`, `taker_amount`, `timestamp`, `block_number`
 
 **Transform steps — Layer A (all trades):**
-- [ ] Sort trades by timestamp per market ticker / token ID
-- [ ] Compute normalized trade price (Kalshi: `yes_price`; Polymarket: amount ratio based on `maker_asset_id == '0'` logic)
-- [ ] Compute signed order flow per trade (+contracts for YES-taker, -contracts for NO-taker)
-- [ ] Compute trade-to-trade fields: `delta_price` (price change from previous trade in same market), `time_since_prev` (seconds since previous trade), `trade_sequence_num` (1, 2, 3... within market)
-- [ ] Compute running cumulative fields: `cumulative_volume`, `cumulative_net_flow`, `cumulative_trade_count`
-- [ ] Compute time-to-expiry at trade time (join with market `close_time`)
-- [ ] Output: enriched trade parquet with all original fields + derived fields, one per platform
+- [x] Sort trades by timestamp per market ticker / token ID
+- [x] Compute normalized trade price (Kalshi: `yes_price`; Polymarket: amount ratio based on `maker_asset_id == '0'` logic)
+- [x] Compute signed order flow per trade (+contracts for YES-taker, -contracts for NO-taker)
+- [x] Compute trade-to-trade fields: `delta_price` (price change from previous trade in same market), `time_since_prev` (seconds since previous trade), `trade_sequence_num` (1, 2, 3... within market)
+- [x] Compute running cumulative fields: `cumulative_volume`, `cumulative_net_flow`, `cumulative_trade_count`
+- [x] Compute time-to-expiry at trade time (join with market `close_time`)
+- [x] Output: enriched trade parquet with all original fields + derived fields, one per platform
 
 **Transform steps — Layer B (liquid markets only):**
-- [ ] Filter to markets with average trade density > threshold (e.g., >5 trades/hour or >100 total trades)
-- [ ] Resample into 5-min / 1-hour / daily bars with OHLCV + net flow + trade count aggregation
-- [ ] Handle gaps: forward-fill close price for empty bars, mark volume and trade count as 0
-- [ ] Compute per-bar derived fields: bar return (close-to-close), bar range (high-low), VWAP
-- [ ] Output: OHLCV parquet per platform per interval granularity, with a qualifying market manifest listing which tickers are included
+- [x] Filter to markets with average trade density > threshold (>5 trades/hour or >100 total trades) — 556,278 qualifying markets
+- [x] Resample into 5-min / 1-hour / daily bars with OHLCV + net flow + trade count aggregation
+- [x] Handle gaps: forward-fill close price for empty bars, mark volume and trade count as 0
+- [x] Compute per-bar derived fields: bar return (close-to-close), bar range (high-low), VWAP
+- [x] Output: OHLCV parquet per platform per interval granularity, with a qualifying market manifest listing which tickers are included
 
 **Unlocks:**
 - Layer A: sequential context for every trade (foundation for T2), time-between-trades as a liquidity proxy, trade numbering for lifecycle analysis
