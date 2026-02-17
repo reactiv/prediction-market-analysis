@@ -3,7 +3,7 @@ from __future__ import annotations
 import duckdb
 
 from src.transforms._base import Transform
-from src.transforms._util import copy_to_parquet
+from src.transforms._util import copy_to_parquet, get_tmp_dir
 
 ACTIVE_THRESHOLD = 1.0  # trades per hour
 
@@ -16,23 +16,36 @@ class T8Lifecycle(Transform):
             dependencies=["t1a"],
         )
 
+    def _make_connection(self) -> duckdb.DuckDBPyConnection:
+        """Create a DuckDB connection with memory/temp settings."""
+        con = duckdb.connect()
+        tmp_dir = get_tmp_dir()
+        con.execute(f"SET temp_directory = '{tmp_dir}'")
+        con.execute("SET memory_limit = '20GB'")
+        con.execute("SET preserve_insertion_order = false")
+        con.execute("SET threads = 4")
+        return con
+
     def run(self):
         self.ensure_output_dir()
         kalshi_dir = self.output_dir / "kalshi"
         kalshi_dir.mkdir(parents=True, exist_ok=True)
 
         timeline_rows = self._build_state_timeline()
-        self._build_per_state_stats()
-        self._build_anomalous_transitions()
-        self._build_duration_distributions()
+        stats_rows = self._build_per_state_stats()
+        anomaly_rows = self._build_anomalous_transitions()
+        duration_rows = self._build_duration_distributions()
 
         self.write_manifest({
             "timeline_rows": timeline_rows,
+            "per_state_stats_rows": stats_rows,
+            "anomalous_transitions": anomaly_rows,
+            "duration_states": duration_rows,
         })
 
     def _build_state_timeline(self) -> int:
         """Build state timeline: assign lifecycle state to every trade."""
-        con = duckdb.connect()
+        con = self._make_connection()
 
         t1a_path = str(self.base_dir / "data" / "transforms" / "t1a" / "kalshi" / "*.parquet")
         markets_path = str(self.base_dir / "data" / "kalshi" / "markets" / "*.parquet")
@@ -40,6 +53,8 @@ class T8Lifecycle(Transform):
 
         active = ACTIVE_THRESHOLD
 
+        # Carry signed_flow and count through the full pipeline so downstream
+        # queries can read them directly from the timeline without re-joining T1A.
         query = f"""
         WITH trades_with_rate AS (
             SELECT
@@ -70,9 +85,6 @@ class T8Lifecycle(Transform):
                 trade_sequence_num,
                 norm_price,
                 signed_flow,
-                cumulative_volume,
-                cumulative_trade_count,
-                time_since_prev,
                 count,
                 CASE
                     WHEN status = 'finalized'
@@ -103,6 +115,8 @@ class T8Lifecycle(Transform):
                 created_time,
                 trade_sequence_num,
                 norm_price,
+                signed_flow,
+                count,
                 state,
                 LAG(state) OVER (
                     PARTITION BY ticker ORDER BY created_time
@@ -114,6 +128,8 @@ class T8Lifecycle(Transform):
             created_time,
             trade_sequence_num,
             norm_price,
+            signed_flow,
+            count,
             state,
             prev_state,
             CASE
@@ -122,46 +138,23 @@ class T8Lifecycle(Transform):
                 ELSE FALSE
             END AS is_transition
         FROM with_transitions
-        ORDER BY ticker, created_time
         """
 
-        # Create a persistent temp view for downstream queries
-        con.execute(f"""
-        CREATE OR REPLACE VIEW state_timeline AS {query}
-        """)
-
         with self.progress("Writing state timeline"):
-            row_count = copy_to_parquet(con, "SELECT * FROM state_timeline", output_dir)
+            row_count = copy_to_parquet(con, query, output_dir)
 
-        # Store connection for reuse in subsequent methods
-        self._con = con
+        con.close()
         return row_count
 
     def _build_per_state_stats(self) -> int:
         """Aggregate statistics per (ticker, state) pair."""
-        con = self._con
+        con = self._make_connection()
         output_dir = str(self.output_dir / "per_state_stats.parquet")
 
-        t1a_path = str(self.base_dir / "data" / "transforms" / "t1a" / "kalshi" / "*.parquet")
         timeline_path = str(self.output_dir / "kalshi" / "state_timeline.parquet" / "*.parquet")
 
+        # No re-join needed — signed_flow and count are in the timeline.
         query = f"""
-        WITH timeline AS (
-            SELECT * FROM read_parquet('{timeline_path}')
-        ),
-        joined AS (
-            SELECT
-                tl.ticker,
-                tl.state,
-                tl.created_time,
-                tl.norm_price,
-                t.signed_flow,
-                t.count
-            FROM timeline tl
-            INNER JOIN read_parquet('{t1a_path}') t
-                ON tl.ticker = t.ticker
-                AND tl.trade_sequence_num = t.trade_sequence_num
-        )
         SELECT
             ticker,
             state,
@@ -173,19 +166,19 @@ class T8Lifecycle(Transform):
             EPOCH(MAX(created_time) - MIN(created_time)) AS duration_seconds,
             MIN(created_time) AS first_entry,
             MAX(created_time) AS last_entry
-        FROM joined
+        FROM read_parquet('{timeline_path}')
         GROUP BY ticker, state
-        ORDER BY ticker, first_entry
         """
 
         with self.progress("Writing per-state stats"):
             row_count = copy_to_parquet(con, query, output_dir)
 
+        con.close()
         return row_count
 
     def _build_anomalous_transitions(self) -> int:
         """Flag transitions that skip expected lifecycle progression."""
-        con = self._con
+        con = self._make_connection()
         output_dir = str(self.output_dir / "anomalous_transitions.parquet")
 
         timeline_path = str(self.output_dir / "kalshi" / "state_timeline.parquet" / "*.parquet")
@@ -225,17 +218,17 @@ class T8Lifecycle(Transform):
            OR (from_state = 'NEWLY_LISTED' AND to_state = 'HIGH_ACTIVITY')
            OR (from_state = 'DORMANT' AND to_state = 'RESOLVING')
            OR (from_state = 'ACTIVE' AND to_state = 'NEWLY_LISTED')
-        ORDER BY ticker, created_time
         """
 
         with self.progress("Writing anomalous transitions"):
             row_count = copy_to_parquet(con, query, output_dir)
 
+        con.close()
         return row_count
 
     def _build_duration_distributions(self) -> int:
         """Compute how long markets spend in each state, then aggregate distributions."""
-        con = self._con
+        con = self._make_connection()
         output_dir = str(self.output_dir / "state_duration_distributions.parquet")
 
         timeline_path = str(self.output_dir / "kalshi" / "state_timeline.parquet" / "*.parquet")
@@ -281,10 +274,10 @@ class T8Lifecycle(Transform):
             COUNT(*) AS count
         FROM stint_durations
         GROUP BY state
-        ORDER BY state
         """
 
         with self.progress("Writing state duration distributions"):
             row_count = copy_to_parquet(con, query, output_dir)
 
+        con.close()
         return row_count

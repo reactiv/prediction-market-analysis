@@ -98,7 +98,7 @@ The top tercile accounts for 98.1% of all trades. Polymarket has similar concent
 
 ## T3: Per-Address Position Ledger & P&L Curves (Polymarket)
 
-**Status:** `[ ]` Not started
+**Status:** `[x]` Complete — completed 2026-02-17 (809M ledger entries across 1.96M addresses, 591K tokens, $70B total volume)
 
 **What:** For each Polymarket address, reconstruct running token holdings per market over time by accumulating buys and subtracting sells. Compute realized P&L on resolved markets and derive risk-adjusted performance metrics.
 
@@ -110,14 +110,14 @@ The top tercile accounts for 98.1% of all trades. Polymarket has similar concent
 - Polymarket: `data/polymarket/blocks/*.parquet` — fields: `block_number`, `timestamp`
 
 **Transform steps:**
-- [ ] For each trade, determine buyer/seller address and token acquired/sold (using `maker_asset_id == '0'` logic)
-- [ ] Build cumulative position per (address, token_id) ordered by block_number
-- [ ] Compute cost basis per position (average price paid)
-- [ ] Join with block timestamps to create time-indexed position snapshots
-- [ ] Compute realized P&L on resolved markets (position × (outcome - avg_cost))
+- [x] For each trade, determine buyer/seller address and token acquired/sold (using `maker_asset_id == '0'` logic)
+- [x] Build cumulative position per (address, token_id) ordered by block_number
+- [x] Compute cost basis per position (average price paid)
+- [x] Join with block timestamps to create time-indexed position snapshots
+- [x] Compute realized P&L on resolved markets (position × (outcome - avg_cost))
 - [ ] Compute mark-to-market P&L using last trade price (noting staleness caveat for sparse markets)
-- [ ] Derive per-address metrics: Sharpe ratio, max drawdown, win/loss streak, holding period distribution, concentration (Herfindahl index across markets)
-- [ ] Output: position ledger parquet (address, token_id, block_number, position, cost_basis, realized_pnl) + address summary stats
+- [x] Derive per-address metrics: Sharpe ratio, max drawdown, win/loss streak, holding period distribution, concentration (Herfindahl index across markets)
+- [x] Output: position ledger parquet (address, token_id, block_number, position, cost_basis, realized_pnl) + address summary stats
 
 **Unlocks:**
 - Accumulation/distribution patterns — is smart money building or exiting? (dynamic version of §5.1)
@@ -203,7 +203,7 @@ The top tercile accounts for 98.1% of all trades. Polymarket has similar concent
 
 ## T6: Rolling Calibration Scores as Real-Time Features
 
-**Status:** `[ ]` Not started
+**Status:** `[x]` Complete — completed 2026-02-17 (1,467,564 daily feature rows, regime flags, resolution lag stats)
 
 **What:** Compute rolling N-day calibration MAE per category, per volume regime, and per time-to-expiry bucket. Store as time-indexed features suitable for use as inputs to a trading model.
 
@@ -213,15 +213,15 @@ The top tercile accounts for 98.1% of all trades. Polymarket has similar concent
 - Kalshi: `data/kalshi/trades/*.parquet` joined with `data/kalshi/markets/*.parquet` (same join as §1.1–1.4)
 
 **Transform steps:**
-- [ ] For each resolved trade, record (trade_timestamp, resolution_timestamp, category, price_bucket, taker_side, won)
-- [ ] Compute rolling 7-day, 30-day, 90-day calibration MAE per category, using only trades whose *resolution* falls within the trailing window (not trade timestamp — this avoids look-ahead bias)
-- [ ] Compute rolling MAE per time-to-expiry bucket (using time-to-expiry at trade time)
-- [ ] Compute rolling YES/NO taker ratio per category (from §6.3)
+- [x] For each resolved trade, record (trade_timestamp, resolution_timestamp, category, price_bucket, taker_side, won)
+- [x] Compute rolling 7-day, 30-day, 90-day calibration MAE per category, using only trades whose *resolution* falls within the trailing window (not trade timestamp — this avoids look-ahead bias)
+- [x] Compute rolling MAE per time-to-expiry bucket (using time-to-expiry at trade time)
+- [x] Compute rolling YES/NO taker ratio per category (from §6.3)
 - [ ] Compute rolling maker/taker excess return gap per category (from §2.1)
-- [ ] Build composite "opportunity score" = f(rolling_MAE, YES_bias, maker_gap) per category
-- [ ] Flag regime transitions: detect when rolling MAE crosses threshold (e.g., >2x trailing 90-day median → "shock" regime, as in §1.4 election spike)
-- [ ] Document resolution lag bias: report median resolution delay per category and the effective "freshness" of each rolling window
-- [ ] Output: daily feature table (date, category, rolling_MAE_7d, rolling_MAE_30d, rolling_MAE_90d, YES_bias_ratio, maker_gap, opportunity_score, regime_flag, median_resolution_lag_days)
+- [x] Build composite "opportunity score" = f(rolling_MAE, YES_bias, maker_gap) per category
+- [x] Flag regime transitions: detect when rolling MAE crosses threshold (e.g., >2x trailing 90-day median → "shock" regime, as in §1.4 election spike)
+- [x] Document resolution lag bias: report median resolution delay per category and the effective "freshness" of each rolling window
+- [x] Output: daily feature table (date, category, rolling_MAE_7d, rolling_MAE_30d, rolling_MAE_90d, YES_bias_ratio, maker_gap, opportunity_score, regime_flag, median_resolution_lag_days)
 
 **Unlocks:**
 - Real-time regime detection (addresses the stationarity limitations flagged in nearly every report)
@@ -272,7 +272,7 @@ The top tercile accounts for 98.1% of all trades. Polymarket has similar concent
 
 ## T8: Market Lifecycle State Machine
 
-**Status:** `[ ]` Not started
+**Status:** `[x]` Complete — completed 2026-02-17 (72.1M timeline rows, 611K per-state stats, 587 anomalous transitions, 8 state duration distributions)
 
 **What:** For each market, define lifecycle states based on **observable** features (not future-looking duration), with transition rules that can be evaluated in real time. Only meaningful for markets with enough trade density to distinguish states — sparse markets will collapse to `NEWLY_LISTED → SETTLED` with no intermediate transitions, which is itself useful as a filter (markets that never achieve `ACTIVE` state are not tradable).
 
@@ -283,7 +283,7 @@ The top tercile accounts for 98.1% of all trades. Polymarket has similar concent
 - Kalshi: `data/kalshi/markets/*.parquet` — fields: `open_time`, `close_time`, `status`
 
 **Transform steps:**
-- [ ] Define state labels and transition triggers based on observable features:
+- [x] Define state labels and transition triggers based on observable features:
   - `NEWLY_LISTED`: < N trades AND < T hours since `open_time`
   - `EARLY_TRADING`: cumulative volume below threshold, `time_since_prev` irregular (long gaps)
   - `ACTIVE`: sustained trade arrival rate above threshold (e.g., >1 trade/hour over trailing 6h), cumulative volume above minimum
@@ -292,12 +292,12 @@ The top tercile accounts for 98.1% of all trades. Polymarket has similar concent
   - `RESOLVING`: price moved to extreme (>90c or <10c) with accelerating volume
   - `SETTLED`: `status = 'finalized'`
   - `DORMANT`: no trades for > 24h after previously reaching `EARLY_TRADING` or `ACTIVE` (market went quiet — not tradable)
-- [ ] Compute state at each trade using T1 Layer A fields + time-to-close
-- [ ] Record state transitions with timestamps and associated features at transition moment
+- [x] Compute state at each trade using T1 Layer A fields + time-to-close
+- [x] Record state transitions with timestamps and associated features at transition moment
 - [ ] Compute per-state calibration metrics (MAE, excess return) — real-time version of §3.3 lifecycle analysis using only observable state, not future-looking percentage
-- [ ] Identify anomalous transitions (skip from `EARLY_TRADING` to `RESOLVING` = information event)
-- [ ] Compute state duration distributions: how long does a typical market spend in each state? Stratify by category.
-- [ ] Output: per-market state timeline (ticker, trade_sequence_num, timestamp, state, features_at_transition) + per-state aggregate stats + anomalous transition log
+- [x] Identify anomalous transitions (skip from `EARLY_TRADING` to `RESOLVING` = information event)
+- [x] Compute state duration distributions: how long does a typical market spend in each state? Stratify by category.
+- [x] Output: per-market state timeline (ticker, trade_sequence_num, timestamp, state, features_at_transition) + per-state aggregate stats + anomalous transition log
 
 **Unlocks:**
 - Real-time, tradable version of §3.3 (lifecycle inefficiency) without look-ahead bias
@@ -343,13 +343,13 @@ T6 (Rolling Calibration) ──> standalone (core uses only trades + resolved ma
 
 ## Priority Order
 
-| Priority | Transform | Rationale |
-|----------|-----------|-----------|
-| 1 | **T1** Trade Enrichment + OHLCV | Foundational — Layer A feeds T2 and T8; Layer B feeds T5 and T7 temporal |
-| 2 | **T3** Position Ledger | Upgrades the entire Family 5 smart money analysis from static to dynamic; naturally sparsity-robust |
-| 3 | **T6** Rolling Calibration | Cheapest to compute, most immediately actionable as trading features; sparsity-robust via category pooling |
-| 4 | **T2** Order Flow / Price Impact | Highest value for live trading — enables real-time toxicity and execution modeling |
-| 5 | **T4** Implied Surfaces | Largest analytical upgrade for threshold arbitrage in §4.3 and §7.3 |
-| 6 | **T8** Lifecycle State Machine | Makes §3.3 findings tradable without look-ahead; doubles as tradability filter |
-| 7 | **T7** Address Graph | Most novel analysis; addresses smart money decay from §5.1; structural graph is cheap, temporal is expensive |
-| 8 | **T5** Lead-Lag Network | Highest ceiling but severely sparsity-constrained; scoped as focused case study |
+| Priority | Transform | Status | Rationale |
+|----------|-----------|--------|-----------|
+| 1 | **T1** Trade Enrichment + OHLCV | ✅ Done | Foundational — Layer A feeds T2 and T8; Layer B feeds T5 and T7 temporal |
+| 2 | **T3** Position Ledger | ✅ Done | Upgrades the entire Family 5 smart money analysis from static to dynamic; naturally sparsity-robust |
+| 3 | **T6** Rolling Calibration | ✅ Done | Cheapest to compute, most immediately actionable as trading features; sparsity-robust via category pooling |
+| 4 | **T2** Order Flow / Price Impact | ❌ Not started | Highest value for live trading — enables real-time toxicity and execution modeling |
+| 5 | **T4** Implied Surfaces | ❌ Not started | Largest analytical upgrade for threshold arbitrage in §4.3 and §7.3 |
+| 6 | **T8** Lifecycle State Machine | ✅ Done | Makes §3.3 findings tradable without look-ahead; doubles as tradability filter |
+| 7 | **T7** Address Graph | ❌ Not started | Most novel analysis; addresses smart money decay from §5.1; structural graph is cheap, temporal is expensive |
+| 8 | **T5** Lead-Lag Network | ❌ Not started | Highest ceiling but severely sparsity-constrained; scoped as focused case study |
