@@ -140,6 +140,21 @@ class BacktestRunner:
                 "ELSE -entry_price "
                 "END"
             )
+        elif strategy.take_side == "maker":
+            # Take the opposite of the taker's side.
+            # Our cost = 100 - entry_price (same as NO when taker is YES).
+            # Profit when taker loses = entry_price cents.
+            # Loss when taker wins = -(100 - entry_price) cents.
+            side_sql = (
+                "CASE WHEN taker_side = 'yes' THEN 'no' ELSE 'yes' END"
+            )
+            won_sql = "taker_side != result"
+            gross_sql = (
+                "CASE WHEN taker_side != result "
+                "THEN entry_price "
+                "ELSE -(100.0 - entry_price) "
+                "END"
+            )
         else:
             raise ValueError(f"Unknown take_side: {strategy.take_side}")
 

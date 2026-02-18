@@ -201,12 +201,13 @@ def transform(name: str | None = None, force: bool = False):
 
 def backtest(name: str | None = None, force: bool = False):
     """Run a backtest strategy by name or show interactive menu."""
+    from dataclasses import replace
+
     from src.backtest.engine import BacktestRunner
+    from src.backtest.strategies.calibration_surface import calibration_surface
     from src.backtest.strategies.fade_longshot import fade_longshot
 
     runner = BacktestRunner()
-
-    from dataclasses import replace
 
     strategies = {
         "fade_longshot": fade_longshot(),
@@ -216,6 +217,10 @@ def backtest(name: str | None = None, force: bool = False):
         "fade_longshot_no_fees": replace(
             fade_longshot(fee_rate=0.0), name="fade_longshot_lt15c_no_fees"
         ),
+        "cal_surface": calibration_surface(),
+        "cal_surface_15c": calibration_surface(max_price=15),
+        "cal_surface_5pp": calibration_surface(min_mae_7d=0.05),
+        "cal_surface_10pp": calibration_surface(min_mae_7d=0.10),
     }
 
     if name:
@@ -262,6 +267,105 @@ def backtest(name: str | None = None, force: bool = False):
         runner.run(strategies[key], force=force)
 
 
+def simulate(name: str | None = None):
+    """Run Monte Carlo simulation + Kelly sizing on a completed backtest."""
+    from src.backtest.distributions import analyze_distribution
+    from src.backtest.kelly import compute_kelly
+    from src.backtest.monte_carlo import run_monte_carlo
+
+    base = Path("data") / "backtests"
+
+    if not name:
+        # List available backtests
+        if not base.exists():
+            print("No backtests found. Run 'backtest' first.")
+            return
+        dirs = sorted(d.name for d in base.iterdir() if (d / "returns.parquet").exists())
+        if not dirs:
+            print("No completed backtests found.")
+            return
+
+        options = list(dirs) + ["[Exit]"]
+        menu = TerminalMenu(
+            options,
+            title="Select a backtest to simulate:",
+            cycle_cursor=True,
+            clear_screen=False,
+        )
+        choice = menu.show()
+        if choice is None or choice == len(options) - 1:
+            print("Exiting.")
+            return
+        name = dirs[choice]
+
+    backtest_dir = base / name
+    if not (backtest_dir / "returns.parquet").exists():
+        print(f"No returns.parquet in {backtest_dir}")
+        sys.exit(1)
+
+    print(f"\n=== Simulation: {name} ===\n")
+
+    # Step 1: Distribution analysis
+    print("1. Analyzing return distribution...")
+    dist = analyze_distribution(backtest_dir)
+    print(f"   n={dist['n']:,}, mean={dist['mean']:.4f}c, std={dist['std']:.4f}c")
+    print(f"   skew={dist['skewness']:.4f}, kurtosis={dist['kurtosis']:.4f}")
+    print(f"   Normal: {dist['normality']['is_normal']}")
+    print(f"   Student-t df={dist['student_t_fit']['df']:.2f}")
+
+    # Step 2: Monte Carlo
+    print("\n2. Running Monte Carlo (10K paths)...")
+    mc = run_monte_carlo(backtest_dir)
+    print(f"   {mc['elapsed_seconds']:.1f}s, {mc['trades_per_path']:,} trades/path")
+    print(f"   PnL median: {mc['pnl']['median']:,.0f}c")
+    print(f"   PnL 5th-95th: [{mc['pnl']['p5']:,.0f}, {mc['pnl']['p95']:,.0f}]")
+    dd = mc["max_drawdown"]
+    print(f"   Drawdown p50: {dd['median']:,.0f}c, p95: {dd['p95']:,.0f}c, p99: {dd['p99']:,.0f}c")
+
+    # Step 3: Kelly sizing
+    print("\n3. Computing Kelly position sizes...")
+    kelly = compute_kelly(backtest_dir, mc_summary=mc)
+    print(f"   Win prob: {kelly['win_probability']:.4f}")
+    print(f"   Payoff ratio: {kelly['payoff_ratio']}")
+    print(f"   Kelly fraction: {kelly['kelly_fraction']:.4f}")
+    print(f"   CV of edge: {kelly['cv_edge']:.4f}")
+    print(f"   Adjusted Kelly: {kelly['kelly_adjusted']:.4f}")
+    print(f"   Half-Kelly: {kelly['half_kelly']:.4f}")
+    print(f"   Avg cost/contract: {kelly['avg_cost_per_contract']:.2f}c")
+
+    print(f"\n   Output: {backtest_dir}/")
+
+
+def sweep(force: bool = False):
+    """Sweep calibration surface thresholds to find optimal entry rules."""
+    from src.backtest.engine import BacktestRunner
+    from src.backtest.strategies.calibration_surface import calibration_sweep
+
+    runner = BacktestRunner()
+    strategies = calibration_sweep()
+
+    print(f"\nSweeping {len(strategies)} thresholds...\n")
+    print(f"{'Threshold':>10} {'Trades':>10} {'Win Rate':>10} {'Avg Ret':>10} {'Sharpe':>10}")
+    print("-" * 55)
+
+    for strat in strategies:
+        output_dir = runner.run(strat, force=force)
+        manifest = output_dir / "manifest.json"
+        if manifest.exists():
+            import json
+
+            data = json.loads(manifest.read_text())
+            print(
+                f"{strat.name:>10} "
+                f"{data['qualifying_trades']:>10,} "
+                f"{data['win_rate']:>10.4f} "
+                f"{data['avg_return_cents']:>10.4f} "
+                f"{data['sharpe_ratio']:>10.4f}"
+            )
+
+    print("\nSweep complete. Results in data/backtests/")
+
+
 def package():
     """Package the data directory into a zstd-compressed tar archive."""
     success = package_data()
@@ -271,7 +375,7 @@ def package():
 def main():
     if len(sys.argv) < 2:
         print("\nUsage: uv run main.py <command>")
-        print("Commands: analyze, index, transform, backtest, package")
+        print("Commands: analyze, index, transform, backtest, simulate, sweep, package")
         sys.exit(0)
 
     command = sys.argv[1]
@@ -299,12 +403,22 @@ def main():
         backtest(name, force=force)
         sys.exit(0)
 
+    if command == "simulate":
+        name = sys.argv[2] if len(sys.argv) > 2 else None
+        simulate(name)
+        sys.exit(0)
+
+    if command == "sweep":
+        force = "--force" in sys.argv
+        sweep(force=force)
+        sys.exit(0)
+
     if command == "package":
         package()
         sys.exit(0)
 
     print(f"Unknown command: {command}")
-    print("Commands: analyze, index, transform, backtest, package")
+    print("Commands: analyze, index, transform, backtest, simulate, sweep, package")
     sys.exit(1)
 
 
