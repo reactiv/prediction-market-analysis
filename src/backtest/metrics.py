@@ -22,9 +22,9 @@ def compute_metrics(con: duckdb.DuckDBPyConnection, returns_path: Path) -> dict:
             AVG(net_return_cents)                                 AS avg_return,
             STDDEV_POP(net_return_cents)                          AS std_return,
             SUM(net_return_cents * contracts)                     AS total_pnl,
-            SUM(CASE WHEN won THEN net_return_cents * contracts
+            SUM(CASE WHEN won THEN gross_return_cents * contracts
                      ELSE 0 END)                                  AS gross_profit,
-            SUM(CASE WHEN NOT won THEN ABS(net_return_cents) * contracts
+            SUM(CASE WHEN NOT won THEN ABS(gross_return_cents) * contracts
                      ELSE 0 END)                                  AS gross_loss,
             AVG(CASE WHEN won THEN net_return_cents END)          AS avg_win,
             AVG(CASE WHEN NOT won THEN net_return_cents END)      AS avg_loss,
@@ -47,24 +47,26 @@ def compute_metrics(con: duckdb.DuckDBPyConnection, returns_path: Path) -> dict:
     sharpe = avg_ret / std_ret if std_ret > 0 else 0.0
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-    # Sortino: downside deviation only
-    neg_std = con.execute(
+    # Sortino: downside deviation = sqrt(mean(min(r, 0)^2)) over ALL trades
+    dd_dev = con.execute(
         f"""
-        SELECT STDDEV_POP(net_return_cents)
+        SELECT SQRT(AVG(CASE WHEN net_return_cents < 0
+                        THEN net_return_cents * net_return_cents
+                        ELSE 0 END))
         FROM read_parquet('{p}')
-        WHERE NOT won
         """
     ).fetchone()[0]
-    neg_std = float(neg_std) if neg_std else 0.0
-    sortino = avg_ret / neg_std if neg_std > 0 else 0.0
+    dd_dev = float(dd_dev) if dd_dev else 0.0
+    sortino = avg_ret / dd_dev if dd_dev > 0 else 0.0
 
     # Max drawdown via cumulative PnL
     dd = con.execute(
         f"""
         WITH cum AS (
             SELECT
+                ROW_NUMBER() OVER (ORDER BY timestamp, trade_id) AS rn,
                 SUM(net_return_cents * contracts) OVER (
-                    ORDER BY timestamp
+                    ORDER BY timestamp, trade_id
                     ROWS UNBOUNDED PRECEDING
                 ) AS cum_pnl
             FROM read_parquet('{p}')
@@ -73,10 +75,10 @@ def compute_metrics(con: duckdb.DuckDBPyConnection, returns_path: Path) -> dict:
             SELECT
                 cum_pnl,
                 MAX(cum_pnl) OVER (
-                    ORDER BY rowid
+                    ORDER BY rn
                     ROWS UNBOUNDED PRECEDING
                 ) AS peak_pnl
-            FROM (SELECT *, ROW_NUMBER() OVER () AS rowid FROM cum)
+            FROM cum
         )
         SELECT MIN(cum_pnl - peak_pnl) AS max_drawdown
         FROM peaks

@@ -50,8 +50,9 @@ def analyze_distribution(backtest_dir: Path) -> dict:
     shapiro_stat, shapiro_p = stats.shapiro(test_sample)
     jb_stat, jb_p = stats.jarque_bera(r)
 
-    # Fit Student-t distribution
-    t_df, t_loc, t_scale = stats.t.fit(r[:100_000] if n > 100_000 else r)
+    # Fit Student-t distribution (random subsample for speed)
+    fit_sample = r if n <= 100_000 else rng.choice(r, 100_000, replace=False)
+    t_df, t_loc, t_scale = stats.t.fit(fit_sample)
     t_sample = rng.choice(r, min(n, 10_000), replace=False)
     t_ks_stat, t_ks_p = stats.kstest(t_sample, "t", args=(t_df, t_loc, t_scale))
 
