@@ -18,6 +18,7 @@ import pandas as pd
 from scipy import optimize, stats
 
 from src.transforms._base import Transform
+from src.transforms._util import get_tmp_dir
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -111,7 +112,7 @@ def _fit_normal_sf(thresholds: np.ndarray, cdf_vals: np.ndarray):
             cost,
             x0=[mu0, sigma0],
             method="Nelder-Mead",
-            options={"maxiter": 5000, "xatol": 1e-8, "fatol": 1e-12},
+            options={"maxiter": 200, "xatol": 1e-4, "fatol": 1e-6},
         )
 
     mu_fit, sigma_fit = res.x
@@ -161,7 +162,7 @@ def _fit_lognorm_sf(thresholds: np.ndarray, cdf_vals: np.ndarray):
             cost,
             x0=[s0, scale0],
             method="Nelder-Mead",
-            options={"maxiter": 5000, "xatol": 1e-8, "fatol": 1e-12},
+            options={"maxiter": 200, "xatol": 1e-4, "fatol": 1e-6},
         )
 
     s_fit, scale_fit = res.x
@@ -185,12 +186,34 @@ class T4ImpliedSurfaces(Transform):
             dependencies=[],
         )
 
+    def _make_connection(self) -> duckdb.DuckDBPyConnection:
+        """Create a DuckDB connection with tuned settings."""
+        con = duckdb.connect()
+        tmp_dir = get_tmp_dir()
+        con.execute(f"SET memory_limit='20GB'")
+        con.execute(f"SET temp_directory='{tmp_dir}'")
+        con.execute("SET preserve_insertion_order=false")
+        con.execute("SET threads=4")
+        return con
+
     # -----------------------------------------------------------------------
     # run
     # -----------------------------------------------------------------------
 
     def run(self):
         self.ensure_output_dir()
+
+        # Clean up old per-event surface files if they exist
+        old_surfaces_dir = Path(self.output_dir) / "implied_surfaces"
+        if old_surfaces_dir.exists():
+            for f in old_surfaces_dir.glob("*.parquet"):
+                f.unlink()
+
+        # Clean up old per-event evolution files if they exist
+        old_evolution_dir = Path(self.output_dir) / "surface_evolution"
+        if old_evolution_dir.exists():
+            for f in old_evolution_dir.glob("*.parquet"):
+                f.unlink()
 
         n_events = self._build_cross_sectional_surfaces()
         n_evolution = self._build_temporal_evolution()
@@ -209,12 +232,23 @@ class T4ImpliedSurfaces(Transform):
     # -----------------------------------------------------------------------
 
     def _build_cross_sectional_surfaces(self) -> int:
-        surfaces_dir = Path(self.output_dir) / "implied_surfaces"
-        surfaces_dir.mkdir(parents=True, exist_ok=True)
+        surfaces_path = Path(self.output_dir) / "surfaces.parquet"
+
+        # Resume support: skip if already built
+        if surfaces_path.exists():
+            con = self._make_connection()
+            try:
+                count = con.execute(
+                    f"SELECT COUNT(DISTINCT event_ticker) FROM read_parquet('{surfaces_path}')"
+                ).fetchone()[0]
+            finally:
+                con.close()
+            print(f"Phase 1: resuming — {count} surfaces already built")
+            return count
 
         markets_glob = str(Path(self.base_dir) / "data" / "kalshi" / "markets" / "*.parquet")
 
-        con = duckdb.connect()
+        con = self._make_connection()
         try:
             # Find all threshold tickers and group by event
             df_all = con.execute(
@@ -244,6 +278,7 @@ class T4ImpliedSurfaces(Transform):
 
         event_groups = df_all.groupby("event_ticker")
 
+        all_surfaces = []
         n_events = 0
 
         with self.progress("Building cross-sectional surfaces") as _:
@@ -264,12 +299,8 @@ class T4ImpliedSurfaces(Transform):
                 # Enforce monotonicity (non-increasing)
                 mono_cdf = _isotonic_decreasing(raw_cdf)
 
-                # Compute PDF by differencing adjacent CDF points
-                pdf = np.zeros(len(mono_cdf))
-                for i in range(len(mono_cdf) - 1):
-                    pdf[i] = mono_cdf[i] - mono_cdf[i + 1]
-                # Last bucket gets remaining probability mass
-                pdf[-1] = mono_cdf[-1]
+                # Vectorized PDF computation
+                pdf = np.concatenate([-np.diff(mono_cdf), [mono_cdf[-1]]])
 
                 # Fit normal
                 normal_result = _fit_normal_sf(thresholds, mono_cdf)
@@ -313,9 +344,12 @@ class T4ImpliedSurfaces(Transform):
                     }
                 )
 
-                out_path = surfaces_dir / f"{event_ticker}.parquet"
-                surface_df.to_parquet(out_path, index=False)
+                all_surfaces.append(surface_df)
                 n_events += 1
+
+        if all_surfaces:
+            combined = pd.concat(all_surfaces, ignore_index=True)
+            combined.to_parquet(surfaces_path, index=False)
 
         return n_events
 
@@ -326,8 +360,7 @@ class T4ImpliedSurfaces(Transform):
     _TARGET_FAMILY_PATTERNS = ["KXBTCD", "KXNASDAQ100U", "KXETHD", "KXINXU"]
 
     def _build_temporal_evolution(self) -> int:
-        evolution_dir = Path(self.output_dir) / "surface_evolution"
-        evolution_dir.mkdir(parents=True, exist_ok=True)
+        evolution_path = Path(self.output_dir) / "evolution.parquet"
 
         markets_glob = str(Path(self.base_dir) / "data" / "kalshi" / "markets" / "*.parquet")
         trades_glob = str(Path(self.base_dir) / "data" / "kalshi" / "trades" / "*.parquet")
@@ -337,13 +370,12 @@ class T4ImpliedSurfaces(Transform):
         if not trades_path.exists() or not list(trades_path.glob("*.parquet")):
             return 0
 
-        con = duckdb.connect()
-
         # Build the LIKE conditions for target families
         like_clauses = " OR ".join(
             [f"event_ticker LIKE '%{p}%'" for p in self._TARGET_FAMILY_PATTERNS]
         )
 
+        con = self._make_connection()
         try:
             # Get target event tickers and their threshold contracts
             target_markets = con.execute(
@@ -370,10 +402,11 @@ class T4ImpliedSurfaces(Transform):
         )
         target_markets = target_markets.dropna(subset=["threshold"])
 
-        # Build ticker -> (event_ticker, threshold) mapping
-        ticker_info = {}
-        for _, row in target_markets.iterrows():
-            ticker_info[row["ticker"]] = (row["event_ticker"], row["threshold"])
+        # Build ticker -> (event_ticker, threshold) mapping — vectorized
+        ticker_info = dict(zip(
+            target_markets["ticker"],
+            zip(target_markets["event_ticker"], target_markets["threshold"]),
+        ))
 
         # Group tickers by event
         event_tickers_map: dict[str, dict[str, float]] = {}
@@ -390,110 +423,145 @@ class T4ImpliedSurfaces(Transform):
         if not event_tickers_map:
             return 0
 
+        # Single trade scan: load ALL target family trades at once
+        all_target_tickers = []
+        for tickers in event_tickers_map.values():
+            all_target_tickers.extend(tickers.keys())
+
+        ticker_list_sql = ", ".join([f"'{t}'" for t in all_target_tickers])
+
+        con = self._make_connection()
+        try:
+            all_trades_df = con.execute(
+                f"""
+                SELECT
+                    ticker,
+                    yes_price,
+                    created_time
+                FROM read_parquet('{trades_glob}')
+                WHERE ticker IN ({ticker_list_sql})
+                ORDER BY created_time
+                """
+            ).fetchdf()
+        finally:
+            con.close()
+
+        if all_trades_df.empty:
+            return 0
+
+        # Build reverse lookup: ticker -> event_ticker
+        ticker_to_event = {}
+        for evt, tickers in event_tickers_map.items():
+            for t in tickers:
+                ticker_to_event[t] = evt
+
+        # Tag each trade with its event
+        all_trades_df["event_ticker"] = all_trades_df["ticker"].map(ticker_to_event)
+
+        all_evolution_dfs = []
         n_families = 0
 
         with self.progress("Building temporal evolution") as _:
-            # Process each family sequentially for memory safety
             for event_ticker, ticker_thresholds in event_tickers_map.items():
-                family_tickers = list(ticker_thresholds.keys())
+                # Filter trades for this event
+                event_trades = all_trades_df[
+                    all_trades_df["event_ticker"] == event_ticker
+                ]
 
-                # Build SQL IN clause
-                ticker_list_sql = ", ".join([f"'{t}'" for t in family_tickers])
-
-                con = duckdb.connect()
-                try:
-                    trades_df = con.execute(
-                        f"""
-                        SELECT
-                            ticker,
-                            yes_price,
-                            created_time
-                        FROM read_parquet('{trades_glob}')
-                        WHERE ticker IN ({ticker_list_sql})
-                        ORDER BY created_time
-                        """
-                    ).fetchdf()
-                finally:
-                    con.close()
-
-                if trades_df.empty or len(trades_df) < 3:
+                if event_trades.empty or len(event_trades) < 3:
                     continue
 
-                # Forward-fill approach: maintain current price for each ticker
-                current_prices: dict[str, float] = {}
-                evolution_rows = []
-
-                # Sort thresholds for this family
-                sorted_tickers = sorted(
-                    ticker_thresholds.items(), key=lambda kv: kv[1]
-                )
-                sorted_thresholds = np.array([thr for _, thr in sorted_tickers])
-                sorted_ticker_keys = [t for t, _ in sorted_tickers]
+                sorted_items = sorted(ticker_thresholds.items(), key=lambda kv: kv[1])
+                sorted_thresholds = np.array([thr for _, thr in sorted_items])
+                sorted_ticker_keys = [t for t, _ in sorted_items]
                 n_contracts = len(sorted_ticker_keys)
 
-                # Process trades chronologically, subsampling every 100th
-                # eligible trade to avoid running scipy fits on millions of rows.
-                eligible_count = 0
-                for _, trade in trades_df.iterrows():
-                    ticker = trade["ticker"]
-                    price = trade["yes_price"]
-                    trade_time = trade["created_time"]
+                # Require 70% of contracts (min 3) instead of ALL contracts
+                min_required = max(3, int(0.7 * n_contracts))
 
-                    if pd.isna(price):
-                        continue
+                # Vectorized pivot + ffill approach
+                pivot = event_trades.pivot_table(
+                    index="created_time",
+                    columns="ticker",
+                    values="yes_price",
+                    aggfunc="last",
+                )
+                pivot = pivot.sort_index()
+                pivot = pivot.ffill()
 
-                    current_prices[ticker] = float(price)
+                # Filter columns to only our sorted tickers (some may be missing)
+                available_tickers = [t for t in sorted_ticker_keys if t in pivot.columns]
+                if len(available_tickers) < min_required:
+                    continue
 
-                    # Only compute surface when we have prices for all contracts
-                    if len(current_prices) < n_contracts:
-                        continue
+                pivot = pivot[available_tickers]
 
-                    eligible_count += 1
-                    if eligible_count % 100 != 0:
-                        continue
+                # Count valid (non-NaN) prices per row
+                valid_counts = pivot.notna().sum(axis=1)
+                pivot = pivot[valid_counts >= min_required]
 
-                    # Build current CDF
-                    cdf_vals = np.array(
-                        [current_prices.get(t, np.nan) for t in sorted_ticker_keys]
-                    ) / 100.0
+                if pivot.empty:
+                    continue
+
+                # Subsample every 100th row
+                pivot = pivot.iloc[::100]
+
+                if pivot.empty:
+                    continue
+
+                # Map available tickers to their thresholds, sorted by threshold
+                avail_thresholds = np.array(
+                    [ticker_thresholds[t] for t in available_tickers]
+                )
+                avail_sorted_idx = np.argsort(avail_thresholds)
+                avail_thresholds_sorted = avail_thresholds[avail_sorted_idx]
+                avail_tickers_sorted = [available_tickers[i] for i in avail_sorted_idx]
+
+                evolution_rows = []
+
+                for trade_time, row in pivot.iterrows():
+                    cdf_vals = row[avail_tickers_sorted].values / 100.0
 
                     if np.any(np.isnan(cdf_vals)):
-                        continue
+                        # Use only non-NaN values
+                        mask = ~np.isnan(cdf_vals)
+                        if mask.sum() < min_required:
+                            continue
+                        valid_thresholds = avail_thresholds_sorted[mask]
+                        cdf_vals = cdf_vals[mask]
+                    else:
+                        valid_thresholds = avail_thresholds_sorted
 
                     # Enforce monotonicity
                     mono_cdf = _isotonic_decreasing(cdf_vals)
 
-                    # Fit normal to get implied mean/std
-                    normal_result = _fit_normal_sf(sorted_thresholds, mono_cdf)
+                    # Skip lognormal in evolution — only fit normal
+                    normal_result = _fit_normal_sf(valid_thresholds, mono_cdf)
                     if normal_result is None:
                         continue
 
                     mu, sigma, _, _ = normal_result
 
-                    # Compute implied skew and kurtosis from the discrete distribution
-                    # Use PDF from differenced CDF
-                    pdf = np.zeros(len(mono_cdf))
-                    for i in range(len(mono_cdf) - 1):
-                        pdf[i] = mono_cdf[i] - mono_cdf[i + 1]
-                    pdf[-1] = mono_cdf[-1]
+                    # Vectorized PDF computation
+                    pdf = np.concatenate([-np.diff(mono_cdf), [mono_cdf[-1]]])
 
                     pdf_sum = pdf.sum()
                     if pdf_sum > 0:
                         pdf_norm = pdf / pdf_sum
-                        emp_mean = np.sum(sorted_thresholds * pdf_norm)
+                        emp_mean = np.sum(valid_thresholds * pdf_norm)
                         emp_var = np.sum(
-                            (sorted_thresholds - emp_mean) ** 2 * pdf_norm
+                            (valid_thresholds - emp_mean) ** 2 * pdf_norm
                         )
                         emp_std = np.sqrt(emp_var) if emp_var > 0 else 1e-12
                         emp_skew = float(
                             np.sum(
-                                ((sorted_thresholds - emp_mean) / emp_std) ** 3
+                                ((valid_thresholds - emp_mean) / emp_std) ** 3
                                 * pdf_norm
                             )
                         )
                         emp_kurt = float(
                             np.sum(
-                                ((sorted_thresholds - emp_mean) / emp_std) ** 4
+                                ((valid_thresholds - emp_mean) / emp_std) ** 4
                                 * pdf_norm
                             )
                             - 3.0
@@ -510,140 +578,113 @@ class T4ImpliedSurfaces(Transform):
                             "implied_std": sigma,
                             "implied_skew": emp_skew,
                             "implied_kurtosis": emp_kurt,
-                            "n_active_contracts": n_contracts,
+                            "n_active_contracts": len(valid_thresholds),
                         }
                     )
 
-                if not evolution_rows:
-                    continue
+                if evolution_rows:
+                    all_evolution_dfs.append(pd.DataFrame(evolution_rows))
+                    n_families += 1
 
-                evo_df = pd.DataFrame(evolution_rows)
-                out_path = evolution_dir / f"{event_ticker}.parquet"
-                evo_df.to_parquet(out_path, index=False)
-                n_families += 1
+        if all_evolution_dfs:
+            combined = pd.concat(all_evolution_dfs, ignore_index=True)
+            combined.to_parquet(evolution_path, index=False)
 
         return n_families
 
     # -----------------------------------------------------------------------
-    # Summary
+    # Phase 3 — Summary (single DuckDB query)
     # -----------------------------------------------------------------------
 
     def _build_summary(self) -> int:
-        surfaces_dir = Path(self.output_dir) / "implied_surfaces"
+        surfaces_path = Path(self.output_dir) / "surfaces.parquet"
 
-        if not surfaces_dir.exists():
+        if not surfaces_path.exists():
             return 0
 
-        surface_files = list(surfaces_dir.glob("*.parquet"))
-        if not surface_files:
+        markets_glob = str(
+            Path(self.base_dir) / "data" / "kalshi" / "markets" / "*.parquet"
+        )
+
+        con = self._make_connection()
+        try:
+            summary_df = con.execute(
+                f"""
+                WITH surface_stats AS (
+                    SELECT
+                        event_ticker,
+                        COUNT(*) AS n_contracts,
+                        MIN(threshold) AS threshold_min,
+                        MAX(threshold) AS threshold_max,
+                        FIRST(ks_normal) AS ks_normal,
+                        FIRST(ks_lognorm) AS ks_lognorm,
+                        FIRST(normal_mean) AS implied_mean,
+                        FIRST(normal_std) AS implied_std
+                    FROM read_parquet('{surfaces_path}')
+                    GROUP BY event_ticker
+                ),
+                resolutions AS (
+                    SELECT
+                        event_ticker,
+                        result,
+                        CAST(regexp_extract(ticker, '-T(\\d+\\.?\\d*)', 1) AS DOUBLE) AS threshold
+                    FROM read_parquet('{markets_glob}')
+                    WHERE ticker LIKE '%-T%'
+                      AND regexp_extract(ticker, '-T(\\d+\\.?\\d*)', 1) != ''
+                      AND result IS NOT NULL
+                      AND result != ''
+                ),
+                resolved_bounds AS (
+                    SELECT
+                        event_ticker,
+                        MAX(CASE WHEN result = 'yes' THEN threshold END) AS max_yes_threshold,
+                        MIN(CASE WHEN result = 'no' THEN threshold END) AS min_no_threshold
+                    FROM resolutions
+                    GROUP BY event_ticker
+                )
+                SELECT
+                    s.event_ticker,
+                    s.n_contracts,
+                    CONCAT(s.threshold_min::VARCHAR, '-', s.threshold_max::VARCHAR) AS threshold_range,
+                    CASE
+                        WHEN s.ks_normal IS NULL AND s.ks_lognorm IS NULL THEN 'none'
+                        WHEN s.ks_lognorm IS NULL THEN 'normal'
+                        WHEN s.ks_normal IS NULL THEN 'lognormal'
+                        WHEN s.ks_normal <= s.ks_lognorm THEN 'normal'
+                        ELSE 'lognormal'
+                    END AS best_fit_model,
+                    CASE
+                        WHEN s.ks_normal IS NULL AND s.ks_lognorm IS NULL THEN NULL
+                        WHEN s.ks_lognorm IS NULL THEN s.ks_normal
+                        WHEN s.ks_normal IS NULL THEN s.ks_lognorm
+                        WHEN s.ks_normal <= s.ks_lognorm THEN s.ks_normal
+                        ELSE s.ks_lognorm
+                    END AS best_ks,
+                    s.implied_mean,
+                    s.implied_std,
+                    r.max_yes_threshold IS NOT NULL
+                        OR r.min_no_threshold IS NOT NULL AS is_resolved,
+                    CASE
+                        WHEN r.max_yes_threshold IS NOT NULL
+                            AND r.min_no_threshold IS NOT NULL
+                            THEN (r.max_yes_threshold + r.min_no_threshold) / 2.0
+                        WHEN r.max_yes_threshold IS NOT NULL THEN r.max_yes_threshold
+                        WHEN r.min_no_threshold IS NOT NULL THEN r.min_no_threshold
+                        ELSE NULL
+                    END AS actual_outcome
+                FROM surface_stats s
+                LEFT JOIN resolved_bounds r ON s.event_ticker = r.event_ticker
+                ORDER BY s.event_ticker
+                """
+            ).fetchdf()
+        finally:
+            con.close()
+
+        if summary_df.empty:
             return 0
 
-        summary_rows = []
+        summary_df.to_parquet(
+            Path(self.output_dir) / "summary_stats.parquet", index=False
+        )
 
-        with self.progress("Building summary statistics") as _:
-            for fpath in surface_files:
-                df = pd.read_parquet(fpath)
-                if df.empty:
-                    continue
-
-                event_ticker = df["event_ticker"].iloc[0]
-                n_contracts = len(df)
-                threshold_min = float(df["threshold"].min())
-                threshold_max = float(df["threshold"].max())
-                threshold_range = f"{threshold_min}-{threshold_max}"
-
-                ks_normal = df["ks_normal"].iloc[0]
-                ks_lognorm = df["ks_lognorm"].iloc[0]
-
-                # Determine best fit model
-                if pd.isna(ks_normal) and pd.isna(ks_lognorm):
-                    best_fit = "none"
-                    best_ks = np.nan
-                elif pd.isna(ks_lognorm):
-                    best_fit = "normal"
-                    best_ks = ks_normal
-                elif pd.isna(ks_normal):
-                    best_fit = "lognormal"
-                    best_ks = ks_lognorm
-                else:
-                    if ks_normal <= ks_lognorm:
-                        best_fit = "normal"
-                        best_ks = ks_normal
-                    else:
-                        best_fit = "lognormal"
-                        best_ks = ks_lognorm
-
-                implied_mean = df["normal_mean"].iloc[0]
-                implied_std = df["normal_std"].iloc[0]
-
-                # Check if resolved — look for actual outcome via markets data
-                is_resolved = False
-                actual_outcome = np.nan
-                markets_glob = str(
-                    Path(self.base_dir)
-                    / "data"
-                    / "kalshi"
-                    / "markets"
-                    / "*.parquet"
-                )
-                con = duckdb.connect()
-                try:
-                    resolved_df = con.execute(
-                        f"""
-                        SELECT
-                            ticker,
-                            result,
-                            regexp_extract(ticker, '-T(\\d+\\.?\\d*)', 1) AS threshold_str
-                        FROM read_parquet('{markets_glob}')
-                        WHERE event_ticker = '{event_ticker}'
-                          AND result IS NOT NULL
-                          AND result != ''
-                        ORDER BY CAST(regexp_extract(ticker, '-T(\\d+\\.?\\d*)', 1) AS DOUBLE)
-                        """
-                    ).fetchdf()
-                except Exception:
-                    resolved_df = pd.DataFrame()
-                finally:
-                    con.close()
-
-                if not resolved_df.empty:
-                    is_resolved = True
-                    # The actual outcome lies between the highest YES-resolved
-                    # threshold and the lowest NO-resolved threshold.
-                    resolved_df["threshold"] = pd.to_numeric(
-                        resolved_df["threshold_str"], errors="coerce"
-                    )
-                    yes_resolved = resolved_df[resolved_df["result"] == "yes"]
-                    no_resolved = resolved_df[resolved_df["result"] == "no"]
-
-                    if not yes_resolved.empty and not no_resolved.empty:
-                        # Actual value is between max YES threshold and min NO threshold
-                        upper = float(no_resolved["threshold"].min())
-                        lower = float(yes_resolved["threshold"].max())
-                        actual_outcome = (lower + upper) / 2.0
-                    elif not yes_resolved.empty:
-                        actual_outcome = float(yes_resolved["threshold"].max())
-                    elif not no_resolved.empty:
-                        actual_outcome = float(no_resolved["threshold"].min())
-
-                summary_rows.append(
-                    {
-                        "event_ticker": event_ticker,
-                        "n_contracts": n_contracts,
-                        "threshold_range": threshold_range,
-                        "best_fit_model": best_fit,
-                        "best_ks": best_ks,
-                        "implied_mean": implied_mean,
-                        "implied_std": implied_std,
-                        "is_resolved": is_resolved,
-                        "actual_outcome": actual_outcome,
-                    }
-                )
-
-        if summary_rows:
-            summary_df = pd.DataFrame(summary_rows)
-            summary_df.to_parquet(
-                Path(self.output_dir) / "summary_stats.parquet", index=False
-            )
-
-        return len(summary_rows)
+        return len(summary_df)
