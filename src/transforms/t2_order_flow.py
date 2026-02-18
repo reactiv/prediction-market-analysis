@@ -1,12 +1,26 @@
+"""T2: Order flow imbalance & price impact.
+
+Builds three derived datasets from T1A enriched trades (Kalshi only):
+  1. Impact curves: category-pooled price impact regressions
+  2. Rolling OFI: per-market order flow imbalance at 20/50/100 trade windows
+  3. VPIN: volume-synchronized probability of informed trading
+
+Performance notes (vs original):
+  - Tuned DuckDB connections (memory limit, temp dir, threading)
+  - Resume support: skip phases whose output already exists
+  - OFI: project only needed columns instead of SELECT *
+  - VPIN: reuse T1A's cumulative_volume instead of recomputing
+"""
+
 from __future__ import annotations
 
-import os
+from pathlib import Path
 
 import duckdb
 
 from src.analysis.kalshi.util.categories import CATEGORY_SQL
 from src.transforms._base import Transform
-from src.transforms._util import copy_to_parquet
+from src.transforms._util import copy_to_parquet, get_tmp_dir
 
 
 class T2OrderFlow(Transform):
@@ -16,6 +30,24 @@ class T2OrderFlow(Transform):
             description="Order flow imbalance & price impact",
             dependencies=["t1a", "t1b"],
         )
+
+    def _make_connection(self) -> duckdb.DuckDBPyConnection:
+        """Create a DuckDB connection with tuned settings."""
+        con = duckdb.connect()
+        tmp_dir = get_tmp_dir()
+        con.execute("SET memory_limit='20GB'")
+        con.execute(f"SET temp_directory='{tmp_dir}'")
+        con.execute("SET preserve_insertion_order=false")
+        con.execute("SET threads=4")
+        return con
+
+    @property
+    def _t1a_glob(self) -> str:
+        return str(Path(self.base_dir) / "data" / "transforms" / "t1a" / "kalshi" / "*.parquet")
+
+    @property
+    def _qualifying_path(self) -> str:
+        return str(Path(self.base_dir) / "data" / "transforms" / "t1b" / "qualifying_markets.parquet")
 
     def run(self):
         self.ensure_output_dir()
@@ -32,17 +64,30 @@ class T2OrderFlow(Transform):
 
     def _build_impact_curves(self) -> int:
         """Part 1: Category-pooled impact curves (Kalshi, ALL trades)."""
-        with self.progress("Building category-pooled impact curves"):
-            t1a_glob = os.path.join(
-                self.base_dir, "data", "transforms", "t1a", "kalshi", "*.parquet"
-            )
-            output_path = os.path.join(self.output_dir, "impact_curves.parquet")
+        output_path = Path(self.output_dir) / "impact_curves.parquet"
 
-            con = duckdb.connect()
+        # Resume: skip if already built
+        if output_path.exists():
+            con = self._make_connection()
+            try:
+                count = con.execute(
+                    f"SELECT COUNT(*) FROM read_parquet('{output_path}')"
+                ).fetchone()[0]
+            finally:
+                con.close()
+            print(f"  Impact curves: resuming — {count} rows already built")
+            return count
+
+        with self.progress("Building category-pooled impact curves"):
+            con = self._make_connection()
             query = f"""
                 WITH tagged AS (
                     SELECT
-                        *,
+                        event_ticker,
+                        count,
+                        delta_price,
+                        signed_flow,
+                        time_to_expiry_seconds,
                         {CATEGORY_SQL} AS category,
                         CASE
                             WHEN count = 1 THEN '1'
@@ -58,7 +103,7 @@ class T2OrderFlow(Transform):
                             WHEN time_to_expiry_seconds < 604800 THEN '1-7d'
                             ELSE '7d+'
                         END AS expiry_bucket
-                    FROM read_parquet('{t1a_glob}')
+                    FROM read_parquet('{self._t1a_glob}')
                 )
                 SELECT
                     category,
@@ -76,38 +121,51 @@ class T2OrderFlow(Transform):
             """
 
             df = con.execute(query).df()
-            df.to_parquet(output_path)
+            df.to_parquet(str(output_path))
             row_count = len(df)
             con.close()
             return row_count
 
     def _build_rolling_ofi(self) -> int:
         """Part 2: Per-market rolling OFI for liquid (qualifying) markets."""
+        ofi_output_dir = Path(self.output_dir) / "kalshi_ofi"
+
+        # Resume: skip if already built
+        if ofi_output_dir.exists() and list(ofi_output_dir.glob("*.parquet")):
+            con = self._make_connection()
+            try:
+                count = con.execute(
+                    f"SELECT COUNT(*) FROM read_parquet('{ofi_output_dir}/*.parquet')"
+                ).fetchone()[0]
+            finally:
+                con.close()
+            print(f"  OFI: resuming — {count} rows already built")
+            return count
+
         with self.progress("Computing rolling order flow imbalance"):
-            t1a_glob = os.path.join(
-                self.base_dir, "data", "transforms", "t1a", "kalshi", "*.parquet"
-            )
-            qualifying_path = os.path.join(
-                self.base_dir,
-                "data",
-                "transforms",
-                "t1b",
-                "qualifying_markets.parquet",
-            )
-            ofi_output_dir = os.path.join(self.output_dir, "kalshi_ofi")
-            os.makedirs(ofi_output_dir, exist_ok=True)
+            ofi_output_dir.mkdir(parents=True, exist_ok=True)
+            con = self._make_connection()
 
-            con = duckdb.connect()
-
+            # Project only the columns needed for OFI + downstream analysis
             query = f"""
                 WITH qualifying AS (
                     SELECT market_id
-                    FROM read_parquet('{qualifying_path}')
+                    FROM read_parquet('{self._qualifying_path}')
                     WHERE platform = 'kalshi'
                 ),
                 t1a_kalshi AS (
-                    SELECT t.*
-                    FROM read_parquet('{t1a_glob}') t
+                    SELECT
+                        t.ticker,
+                        t.trade_sequence_num,
+                        t.signed_flow,
+                        t.norm_price,
+                        t.created_time,
+                        t.count,
+                        t.delta_price,
+                        t.cumulative_volume,
+                        t.cumulative_net_flow,
+                        t.time_to_expiry_seconds
+                    FROM read_parquet('{self._t1a_glob}') t
                     SEMI JOIN qualifying q ON t.ticker = q.market_id
                 )
                 SELECT
@@ -127,42 +185,46 @@ class T2OrderFlow(Transform):
                 FROM t1a_kalshi
             """
 
-            row_count = copy_to_parquet(con, query, ofi_output_dir)
+            row_count = copy_to_parquet(con, query, str(ofi_output_dir))
             con.close()
             return row_count
 
     def _build_vpin(self) -> int:
         """Part 3: VPIN (Volume-synchronized Probability of Informed Trading)."""
+        vpin_output_dir = Path(self.output_dir) / "kalshi_vpin"
+
+        # Resume: skip if already built
+        if vpin_output_dir.exists() and list(vpin_output_dir.glob("*.parquet")):
+            con = self._make_connection()
+            try:
+                count = con.execute(
+                    f"SELECT COUNT(*) FROM read_parquet('{vpin_output_dir}/*.parquet')"
+                ).fetchone()[0]
+            finally:
+                con.close()
+            print(f"  VPIN: resuming — {count} rows already built")
+            return count
+
         with self.progress("Computing VPIN"):
-            t1a_glob = os.path.join(
-                self.base_dir, "data", "transforms", "t1a", "kalshi", "*.parquet"
-            )
-            qualifying_path = os.path.join(
-                self.base_dir,
-                "data",
-                "transforms",
-                "t1b",
-                "qualifying_markets.parquet",
-            )
-            vpin_output_dir = os.path.join(self.output_dir, "kalshi_vpin")
-            os.makedirs(vpin_output_dir, exist_ok=True)
+            vpin_output_dir.mkdir(parents=True, exist_ok=True)
+            con = self._make_connection()
 
-            con = duckdb.connect()
-
+            # Use T1A's existing cumulative_volume instead of recomputing
             query = f"""
                 WITH qualifying AS (
-                    SELECT ticker
-                    FROM read_parquet('{qualifying_path}')
+                    SELECT market_id
+                    FROM read_parquet('{self._qualifying_path}')
                     WHERE platform = 'kalshi'
                 ),
                 t1a_kalshi AS (
-                    SELECT t.*,
-                        SUM(count) OVER (
-                            PARTITION BY t.ticker
-                            ORDER BY t.trade_sequence_num
-                        ) AS cumulative_volume
-                    FROM read_parquet('{t1a_glob}') t
-                    SEMI JOIN qualifying q ON t.ticker = q.ticker
+                    SELECT
+                        t.ticker,
+                        t.trade_sequence_num,
+                        t.signed_flow,
+                        t.count,
+                        t.cumulative_volume
+                    FROM read_parquet('{self._t1a_glob}') t
+                    SEMI JOIN qualifying q ON t.ticker = q.market_id
                 ),
                 bucket_agg AS (
                     SELECT
@@ -193,6 +255,6 @@ class T2OrderFlow(Transform):
                 SELECT * FROM vpin
             """
 
-            row_count = copy_to_parquet(con, query, vpin_output_dir)
+            row_count = copy_to_parquet(con, query, str(vpin_output_dir))
             con.close()
             return row_count

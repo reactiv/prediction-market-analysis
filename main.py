@@ -199,6 +199,69 @@ def transform(name: str | None = None, force: bool = False):
         instance.execute(force=force)
 
 
+def backtest(name: str | None = None, force: bool = False):
+    """Run a backtest strategy by name or show interactive menu."""
+    from src.backtest.engine import BacktestRunner
+    from src.backtest.strategies.fade_longshot import fade_longshot
+
+    runner = BacktestRunner()
+
+    from dataclasses import replace
+
+    strategies = {
+        "fade_longshot": fade_longshot(),
+        "fade_longshot_5c": fade_longshot(max_price=5),
+        "fade_longshot_10c": fade_longshot(max_price=10),
+        "fade_longshot_20c": fade_longshot(max_price=20),
+        "fade_longshot_no_fees": replace(
+            fade_longshot(fee_rate=0.0), name="fade_longshot_lt15c_no_fees"
+        ),
+    }
+
+    if name:
+        if name == "all":
+            print("\nRunning all backtests...\n")
+            for strat in strategies.values():
+                runner.run(strat, force=force)
+            print("\nAll backtests complete.")
+            return
+
+        if name in strategies:
+            runner.run(strategies[name], force=force)
+            return
+
+        print(f"Strategy '{name}' not found. Available strategies:")
+        for key, strat in strategies.items():
+            print(f"  - {key}: {strat.description}")
+        sys.exit(1)
+
+    # Interactive menu
+    options = ["[All] Run all backtests"]
+    strat_keys = list(strategies.keys())
+    for key in strat_keys:
+        strat = strategies[key]
+        options.append(f"{key}: {strat.description}")
+    options.append("[Exit]")
+
+    menu = TerminalMenu(
+        options,
+        title="Select a backtest to run (use arrow keys):",
+        cycle_cursor=True,
+        clear_screen=False,
+    )
+    choice = menu.show()
+
+    if choice is None or choice == len(options) - 1:
+        print("Exiting.")
+        return
+
+    if choice == 0:
+        backtest("all", force=force)
+    else:
+        key = strat_keys[choice - 1]
+        runner.run(strategies[key], force=force)
+
+
 def package():
     """Package the data directory into a zstd-compressed tar archive."""
     success = package_data()
@@ -208,7 +271,7 @@ def package():
 def main():
     if len(sys.argv) < 2:
         print("\nUsage: uv run main.py <command>")
-        print("Commands: analyze, index, transform, package")
+        print("Commands: analyze, index, transform, backtest, package")
         sys.exit(0)
 
     command = sys.argv[1]
@@ -229,12 +292,19 @@ def main():
         transform(name, force=force)
         sys.exit(0)
 
+    if command == "backtest":
+        force = "--force" in sys.argv
+        args = [a for a in sys.argv[2:] if a != "--force"]
+        name = args[0] if args else None
+        backtest(name, force=force)
+        sys.exit(0)
+
     if command == "package":
         package()
         sys.exit(0)
 
     print(f"Unknown command: {command}")
-    print("Commands: analyze, index, transform, package")
+    print("Commands: analyze, index, transform, backtest, package")
     sys.exit(1)
 
 
