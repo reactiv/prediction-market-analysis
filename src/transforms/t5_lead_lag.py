@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 from typing import Any
 
@@ -11,6 +12,7 @@ from scipy.signal import correlate
 from statsmodels.tsa.stattools import grangercausalitytests
 
 from src.transforms._base import Transform
+from src.transforms._util import get_tmp_dir
 
 logger = logging.getLogger(__name__)
 
@@ -35,23 +37,64 @@ class T5LeadLag(Transform):
         )
 
     # -----------------------------------------------------------------------
+    # DuckDB connection (tuned, matching T4 pattern)
+    # -----------------------------------------------------------------------
+    def _make_connection(self) -> duckdb.DuckDBPyConnection:
+        con = duckdb.connect()
+        tmp_dir = get_tmp_dir()
+        con.execute("SET memory_limit='20GB'")
+        con.execute(f"SET temp_directory='{tmp_dir}'")
+        con.execute("SET preserve_insertion_order=false")
+        con.execute("SET threads=4")
+        return con
+
+    # -----------------------------------------------------------------------
     # Public entry point
     # -----------------------------------------------------------------------
     def run(self) -> None:
         self.ensure_output_dir()
 
+        # Resume: if output + manifest already exist, skip entirely
+        summary_path = self.output_dir / "lead_lag_summary.parquet"
+        manifest_path = self.output_dir / "manifest.json"
+        if summary_path.exists() and manifest_path.exists():
+            try:
+                meta = json.loads(manifest_path.read_text())
+                if meta.get("valid_pairs", 0) > 0:
+                    logger.info(
+                        "Resuming — lead_lag_summary.parquet already exists with %d valid pairs",
+                        meta["valid_pairs"],
+                    )
+                    return
+            except (json.JSONDecodeError, KeyError):
+                pass
+
         pairs = self._curate_pairs()
         logger.info("Curated %d candidate pairs", len(pairs))
 
+        if not pairs:
+            logger.warning("No candidate pairs found")
+            self.write_manifest({"total_pairs_considered": 0, "valid_pairs": 0})
+            return
+
+        # Preload all bar data in 2 queries (one per platform)
+        bar_cache = self._preload_bars(pairs)
+        logger.info("Preloaded bars for %d markets", len(bar_cache))
+
         results: list[dict[str, Any]] = []
-        for pair in pairs:
-            result = self._analyze_pair(pair)
-            if result is not None:
-                results.append(result)
+        with self.progress("Computing lead-lag pairs") as _:
+            for i, pair in enumerate(pairs):
+                _, market_id_a, _, market_id_b, _ = pair
+                logger.info(
+                    "Pair %d/%d: %s vs %s", i + 1, len(pairs), market_id_a, market_id_b
+                )
+                result = self._analyze_pair(pair, bar_cache)
+                if result is not None:
+                    results.append(result)
 
         if results:
             df = pd.DataFrame(results)
-            df.to_parquet(self.output_dir / "lead_lag_summary.parquet", index=False)
+            df.to_parquet(summary_path, index=False)
             logger.info(
                 "Wrote lead_lag_summary.parquet with %d valid pairs", len(results)
             )
@@ -68,32 +111,31 @@ class T5LeadLag(Transform):
     # -----------------------------------------------------------------------
     # Step 1: Curate market pairs
     # -----------------------------------------------------------------------
-    def _curate_pairs(
-        self,
-    ) -> list[tuple[str, str, str, str, str]]:
-        """Return ~20 pairs as (platform_a, market_id_a, platform_b, market_id_b, pair_type)."""
+    def _curate_pairs(self) -> list[tuple[str, str, str, str, str]]:
+        """Return ~20-60 pairs as (platform_a, market_id_a, platform_b, market_id_b, pair_type)."""
         qm_path = self.base_dir / "data" / "transforms" / "t1b" / "qualifying_markets.parquet"
 
-        con = duckdb.connect()
-        qm = con.execute(
-            """
-            SELECT platform, market_id, event_ticker, total_trades
-            FROM read_parquet(?)
-            ORDER BY total_trades DESC
-            """,
-            [str(qm_path)],
-        ).fetchdf()
-        con.close()
+        con = self._make_connection()
+        try:
+            qm = con.execute(
+                """
+                SELECT platform, market_id, total_trades
+                FROM read_parquet(?)
+                ORDER BY total_trades DESC
+                """,
+                [str(qm_path)],
+            ).fetchdf()
+        finally:
+            con.close()
 
         pairs: list[tuple[str, str, str, str, str]] = []
 
         # ----- Intra-family pairs (Kalshi threshold families) -----
         kalshi = qm[qm["platform"] == "kalshi"].copy()
-        if not kalshi.empty and "event_ticker" in kalshi.columns:
-            # Group by event_ticker prefix (first segment before hyphen)
-            kalshi["family"] = kalshi["event_ticker"].astype(str).apply(
-                lambda t: t.split("-")[0] if "-" in str(t) else str(t)
-            )
+        if not kalshi.empty:
+            # Extract family prefix from market_id: e.g. KXBTCD-25MAR0500-T87249.99 → KXBTCD
+            kalshi["family"] = kalshi["market_id"].str.split("-").str[0]
+
             family_counts = (
                 kalshi.groupby("family")["market_id"]
                 .count()
@@ -103,7 +145,6 @@ class T5LeadLag(Transform):
                 "n_members", ascending=False
             )
 
-            # For each family pick top members by volume and create pairs
             families_used = 0
             for _, fam_row in family_counts.iterrows():
                 if families_used >= TOP_FAMILIES:
@@ -136,7 +177,7 @@ class T5LeadLag(Transform):
                         )
                     )
 
-        # If we somehow have zero pairs, try intra-platform for polymarket too
+        # Fallback: intra-platform pairs if nothing else
         if len(pairs) == 0:
             for platform_name in ["kalshi", "polymarket"]:
                 plat = qm[qm["platform"] == platform_name].head(6)
@@ -154,26 +195,100 @@ class T5LeadLag(Transform):
         return pairs
 
     # -----------------------------------------------------------------------
-    # Step 2-5: Analyze a single pair
+    # Preload bars: 2 DuckDB scans instead of ~100
+    # -----------------------------------------------------------------------
+    def _preload_bars(
+        self, pairs: list[tuple[str, str, str, str, str]]
+    ) -> dict[tuple[str, str], pd.DataFrame]:
+        """Load all needed bars in one query per platform. Returns {(platform, market_id): df}."""
+        # Collect unique (platform, market_id) tuples
+        needed: dict[str, set[str]] = {}
+        for platform_a, market_id_a, platform_b, market_id_b, _ in pairs:
+            needed.setdefault(platform_a, set()).add(market_id_a)
+            needed.setdefault(platform_b, set()).add(market_id_b)
+
+        cache: dict[tuple[str, str], pd.DataFrame] = {}
+        con = self._make_connection()
+        try:
+            for platform, market_ids in needed.items():
+                bars_dir = (
+                    self.base_dir
+                    / "data"
+                    / "transforms"
+                    / "t1b"
+                    / platform
+                    / "bars_5min"
+                )
+                if not bars_dir.exists():
+                    logger.warning("Bars directory missing: %s", bars_dir)
+                    continue
+
+                glob_path = str(bars_dir / "**" / "*.parquet")
+                id_list = list(market_ids)
+
+                # Build parameterized IN clause
+                placeholders = ", ".join(["?"] * len(id_list))
+                query = f"""
+                    SELECT ticker, bar_start, close, bar_return
+                    FROM read_parquet('{glob_path}')
+                    WHERE ticker IN ({placeholders})
+                    ORDER BY ticker, bar_start
+                """
+                try:
+                    df = con.execute(query, id_list).fetchdf()
+                except Exception:
+                    logger.warning(
+                        "Failed to preload bars for %s", platform, exc_info=True
+                    )
+                    continue
+
+                if df.empty:
+                    continue
+
+                df["bar_start"] = pd.to_datetime(df["bar_start"], utc=True).dt.tz_localize(None)
+
+                # Split into per-market DataFrames
+                for ticker, group in df.groupby("ticker"):
+                    cache[(platform, ticker)] = group.reset_index(drop=True)
+
+                logger.info(
+                    "Preloaded %d markets from %s (%d total bars)",
+                    len(df["ticker"].unique()),
+                    platform,
+                    len(df),
+                )
+        finally:
+            con.close()
+
+        return cache
+
+    # -----------------------------------------------------------------------
+    # Analyze a single pair
     # -----------------------------------------------------------------------
     def _analyze_pair(
-        self, pair: tuple[str, str, str, str, str]
+        self,
+        pair: tuple[str, str, str, str, str],
+        bar_cache: dict[tuple[str, str], pd.DataFrame],
     ) -> dict[str, Any] | None:
         platform_a, market_id_a, platform_b, market_id_b, pair_type = pair
 
-        # --- Step 2: Align 5-min bars to common clock ---
-        bars_a = self._read_bars(platform_a, market_id_a)
-        bars_b = self._read_bars(platform_b, market_id_b)
+        # Look up bars from cache
+        bars_a = bar_cache.get((platform_a, market_id_a))
+        bars_b = bar_cache.get((platform_b, market_id_b))
 
         if bars_a is None or bars_b is None:
             return None
         if bars_a.empty or bars_b.empty:
             return None
 
-        # Full outer join on bar_start
+        # Full outer join on bar_start, using bar_return directly
         merged = pd.merge(
-            bars_a[["bar_start", "close"]].rename(columns={"close": "close_a"}),
-            bars_b[["bar_start", "close"]].rename(columns={"close": "close_b"}),
+            bars_a[["bar_start", "close", "bar_return"]].rename(
+                columns={"close": "close_a", "bar_return": "ret_a"}
+            ),
+            bars_b[["bar_start", "close", "bar_return"]].rename(
+                columns={"close": "close_b", "bar_return": "ret_b"}
+            ),
             on="bar_start",
             how="outer",
         ).sort_values("bar_start")
@@ -188,39 +303,33 @@ class T5LeadLag(Transform):
         if pct_a < MIN_OVERLAP_PCT or pct_b < MIN_OVERLAP_PCT:
             return None
 
-        # Forward-fill then drop remaining NaNs for aligned returns
+        # Forward-fill close prices, then forward-fill returns, drop remaining NaNs
         merged = merged.sort_values("bar_start")
         merged["close_a"] = merged["close_a"].ffill()
         merged["close_b"] = merged["close_b"].ffill()
+        merged["ret_a"] = merged["ret_a"].fillna(0.0)
+        merged["ret_b"] = merged["ret_b"].fillna(0.0)
         merged = merged.dropna(subset=["close_a", "close_b"])
 
         if len(merged) < ROLLING_WINDOW_BARS:
             return None
 
-        # Compute returns
-        merged["ret_a"] = merged["close_a"].pct_change()
-        merged["ret_b"] = merged["close_b"].pct_change()
-        merged = merged.dropna(subset=["ret_a", "ret_b"])
-
-        if len(merged) < ROLLING_WINDOW_BARS:
-            return None
-
-        ret_a = merged["ret_a"].values
-        ret_b = merged["ret_b"].values
+        ret_a = merged["ret_a"].values.astype(float)
+        ret_b = merged["ret_b"].values.astype(float)
         n_aligned = len(merged)
         pct_overlap = min(pct_a, pct_b)
 
-        # --- Step 3: Cross-correlation ---
+        # --- Cross-correlation ---
         peak_lag_bars, peak_correlation = self._cross_correlation(ret_a, ret_b)
         peak_lag_minutes = peak_lag_bars * BAR_RESOLUTION_MIN
 
-        # --- Rolling cross-correlation for lag stability (Step 5) ---
+        # --- Rolling cross-correlation for lag stability ---
         median_lag, lag_std, lag_consistency_pct = self._rolling_cross_correlation(
             ret_a, ret_b
         )
 
-        # --- Step 4: Granger causality ---
-        gc_results = self._granger_causality(ret_a, ret_b)
+        # --- Directional Granger causality ---
+        gc_results = self._granger_causality(ret_a, ret_b, peak_lag_bars)
 
         return {
             "platform_a": platform_a,
@@ -245,56 +354,6 @@ class T5LeadLag(Transform):
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
-    def _read_bars(self, platform: str, market_id: str) -> pd.DataFrame | None:
-        """Read 5-min bar parquet files for a given market.
-
-        T1B outputs bars into a directory (PER_THREAD_OUTPUT), so we glob for
-        all *.parquet files inside the directory and filter to the market_id.
-        """
-        bars_dir = (
-            self.base_dir
-            / "data"
-            / "transforms"
-            / "t1b"
-            / platform
-            / "bars_5min.parquet"
-        )
-
-        if not bars_dir.exists():
-            logger.debug("Bars directory does not exist: %s", bars_dir)
-            return None
-
-        parquet_files = list(bars_dir.glob("*.parquet"))
-        if not parquet_files:
-            logger.debug("No parquet files found in %s", bars_dir)
-            return None
-
-        con = duckdb.connect()
-        try:
-            df = con.execute(
-                """
-                SELECT bar_start, close
-                FROM read_parquet(?)
-                WHERE market_id = ?
-                ORDER BY bar_start
-                """,
-                [str(bars_dir / "*.parquet"), market_id],
-            ).fetchdf()
-        except Exception:
-            logger.debug(
-                "Failed to read bars for %s / %s", platform, market_id, exc_info=True
-            )
-            return None
-        finally:
-            con.close()
-
-        if df.empty:
-            return None
-
-        # Ensure bar_start is datetime
-        df["bar_start"] = pd.to_datetime(df["bar_start"])
-        return df
-
     @staticmethod
     def _cross_correlation(
         ret_a: np.ndarray, ret_b: np.ndarray
@@ -304,16 +363,14 @@ class T5LeadLag(Transform):
         Positive lag means a leads b (a's past predicts b's future).
         We restrict to lags in [-LAGS_BARS, +LAGS_BARS].
         """
-        # Normalise to zero-mean, unit-variance for interpretable correlation
         a = ret_a - ret_a.mean()
         b = ret_b - ret_b.mean()
-        norm = np.sqrt(np.sum(a ** 2) * np.sum(b ** 2))
+        norm = np.sqrt(np.sum(a**2) * np.sum(b**2))
 
         if norm < 1e-12:
             return 0, 0.0
 
         full_xcorr = correlate(a, b, mode="full") / norm
-        # full_xcorr has length 2*N-1; index N-1 corresponds to lag 0
         n = len(ret_a)
         center = n - 1
 
@@ -332,7 +389,7 @@ class T5LeadLag(Transform):
     def _rolling_cross_correlation(
         ret_a: np.ndarray, ret_b: np.ndarray
     ) -> tuple[float, float, float]:
-        """Rolling cross-correlation with 24h window.
+        """Rolling cross-correlation with 24h window, 50% overlap stride.
 
         Returns (median_lag, lag_std, lag_consistency_pct).
         """
@@ -342,14 +399,15 @@ class T5LeadLag(Transform):
 
         optimal_lags: list[int] = []
 
-        for start in range(0, n - ROLLING_WINDOW_BARS + 1, ROLLING_WINDOW_BARS // 4):
+        # 50% overlap: stride = ROLLING_WINDOW_BARS // 2 (was // 4)
+        for start in range(0, n - ROLLING_WINDOW_BARS + 1, ROLLING_WINDOW_BARS // 2):
             end = start + ROLLING_WINDOW_BARS
             chunk_a = ret_a[start:end]
             chunk_b = ret_b[start:end]
 
             a = chunk_a - chunk_a.mean()
             b = chunk_b - chunk_b.mean()
-            norm = np.sqrt(np.sum(a ** 2) * np.sum(b ** 2))
+            norm = np.sqrt(np.sum(a**2) * np.sum(b**2))
             if norm < 1e-12:
                 continue
 
@@ -370,9 +428,7 @@ class T5LeadLag(Transform):
         median_lag = float(np.median(lags_arr))
         lag_std = float(np.std(lags_arr))
 
-        # Consistency: fraction of windows where sign matches the median sign
         if median_lag == 0:
-            # Consistent if lag is also zero
             consistency = float(np.mean(lags_arr == 0))
         else:
             median_sign = np.sign(median_lag)
@@ -382,11 +438,15 @@ class T5LeadLag(Transform):
 
     @staticmethod
     def _granger_causality(
-        ret_a: np.ndarray, ret_b: np.ndarray
+        ret_a: np.ndarray,
+        ret_b: np.ndarray,
+        peak_lag_bars: int = 0,
     ) -> dict[str, float | None]:
-        """Granger causality tests in both directions.
+        """Directional Granger causality based on cross-correlation peak lag.
 
-        Returns dict with keys: a_to_b_f, a_to_b_p, b_to_a_f, b_to_a_p.
+        If peak_lag > 0: only test a→b (a leads b).
+        If peak_lag < 0: only test b→a (b leads a).
+        If peak_lag == 0: test both directions.
         """
         result: dict[str, float | None] = {
             "a_to_b_f": None,
@@ -395,37 +455,33 @@ class T5LeadLag(Transform):
             "b_to_a_p": None,
         }
 
-        data = np.column_stack([ret_b, ret_a])  # test if a (col 1) causes b (col 0)
-        try:
-            gc = grangercausalitytests(data, maxlag=GRANGER_MAX_LAG, verbose=False)
-            # Pick the lag with the smallest p-value (ssr_ftest)
-            best_p = 1.0
-            best_f = 0.0
-            for lag in range(1, GRANGER_MAX_LAG + 1):
-                f_stat, p_val, _, _ = gc[lag][0]["ssr_ftest"]
-                if p_val < best_p:
-                    best_p = p_val
-                    best_f = f_stat
-            result["a_to_b_f"] = round(best_f, 6)
-            result["a_to_b_p"] = round(best_p, 6)
-        except Exception:
-            logger.debug("Granger a->b test failed", exc_info=True)
+        def _run_granger(x: np.ndarray, y: np.ndarray) -> tuple[float, float] | None:
+            """Test if y Granger-causes x. Returns (best_f, best_p) or None."""
+            data = np.column_stack([x, y])
+            try:
+                gc = grangercausalitytests(data, maxlag=GRANGER_MAX_LAG, verbose=False)
+                best_p = 1.0
+                best_f = 0.0
+                for lag in range(1, GRANGER_MAX_LAG + 1):
+                    f_stat, p_val, _, _ = gc[lag][0]["ssr_ftest"]
+                    if p_val < best_p:
+                        best_p = p_val
+                        best_f = f_stat
+                return round(best_f, 6), round(best_p, 6)
+            except Exception:
+                logger.debug("Granger test failed", exc_info=True)
+                return None
 
-        data_rev = np.column_stack([ret_a, ret_b])  # test if b causes a
-        try:
-            gc_rev = grangercausalitytests(
-                data_rev, maxlag=GRANGER_MAX_LAG, verbose=False
-            )
-            best_p = 1.0
-            best_f = 0.0
-            for lag in range(1, GRANGER_MAX_LAG + 1):
-                f_stat, p_val, _, _ = gc_rev[lag][0]["ssr_ftest"]
-                if p_val < best_p:
-                    best_p = p_val
-                    best_f = f_stat
-            result["b_to_a_f"] = round(best_f, 6)
-            result["b_to_a_p"] = round(best_p, 6)
-        except Exception:
-            logger.debug("Granger b->a test failed", exc_info=True)
+        # Test a→b (does a's past predict b's future?)
+        if peak_lag_bars >= 0:
+            res = _run_granger(ret_b, ret_a)
+            if res:
+                result["a_to_b_f"], result["a_to_b_p"] = res
+
+        # Test b→a (does b's past predict a's future?)
+        if peak_lag_bars <= 0:
+            res = _run_granger(ret_a, ret_b)
+            if res:
+                result["b_to_a_f"], result["b_to_a_p"] = res
 
         return result
