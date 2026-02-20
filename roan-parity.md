@@ -16,7 +16,7 @@ This document maps our current state against the three institutional methods Roa
 | T1B OHLCV bars | Done | 1.6B bars across 556K qualifying markets |
 | T3 position ledger | Done | 809M ledger entries, 1.96M address summaries |
 | T4 implied surfaces | Partial | 19,621 per-event files (stale layout, needs re-run) |
-| T6 rolling calibration | Done | 1.47M daily feature rows with regime flags |
+| T6 rolling calibration | Done | 1.22M daily feature rows with regime flags |
 | T8 lifecycle states | Done | 72.1M timeline rows, 587 anomalous transitions |
 | T2 order flow | Code complete, not run | Impact curves, OFI, VPIN |
 | T5 lead-lag | Code complete, not run | Cross-correlation, Granger causality |
@@ -49,7 +49,7 @@ Five-phase pipeline: (1) extract historical trades matching a strategy pattern, 
 | Roan Phase | Our Coverage | Gap |
 |---|---|---|
 | Phase 1: Historical trade extraction | T1A enrichment (476.7M trades with resolution outcomes) | **Covered** — raw data exists |
-| Phase 1: Strategy pattern filtering | T6 daily features bucketed by (category, price_bucket, tte_bucket) | **Covered** — can filter to any strategy definition |
+| Phase 1: Strategy pattern filtering | T6 daily features bucketed by (category, price_bucket, tte_bucket, taker_side), keyed on resolution date | **Covered** — can filter to any strategy definition |
 | Phase 2: Return distribution | Win rate by price (reports 1.1-1.4), excess return per bucket | **Partial** — we have aggregate win rates, not per-trade return sequences |
 | Phase 3: Monte Carlo resampling | Nothing | **Missing entirely** |
 | Phase 4: Drawdown distribution | Nothing | **Missing entirely** |
@@ -114,14 +114,14 @@ Build a 2D calibration function C(p, t) mapping (contract price, time-to-resolut
 
 | Roan Component | Our Coverage | Gap |
 |---|---|---|
-| 1D calibration (price only) | Reports 1.1-1.4: longshot bias -0.74pp, fav-longshot asymmetry, by-category | **Done thoroughly** |
+| 1D calibration (price only) | Reports 1.1-1.4: longshot bias -1.19pp (contract-weighted), fav-longshot asymmetry, by-category | **Done thoroughly** |
 | Time dimension: calibration vs TTE | Report 3.2: MAE drops 3.2x (4.46pp at 7d+ to 1.41pp final hour) | **Done** |
 | Early market inefficiency | Report 3.3: peak at 15-30% lifecycle (3.8pp MAE) | **Done** |
-| Full 2D surface C(p, t) | T6: daily features by (category, price_bucket, tte_bucket) with mae_7d/30d/90d | **Done — this IS the surface** |
+| Full 2D surface C(p, t) + side | T6: daily features by (category, price_bucket, tte_bucket, taker_side) with mae_7d/30d/90d | **Done — this is the live surface input** |
 | Lifecycle state conditioning | T8: 8 lifecycle states with per-state statistics | **Done** |
 | Opportunity scoring | T6: `opportunity_score = mae_7d * log1p(volume_7d) * (1 + abs(yes_ratio_7d - 0.5))` | **Done** |
 | Regime detection | T6: regime flags when 7d MAE crosses 90d MAE | **Done** |
-| Mispricing function M(p,t) | T6 calibration_error column = `win_rate - implied_prob` per bucket | **Done** |
+| Mispricing function M(p,t) | T6 calibration_error column = `abs(win_rate - implied_prob)` per bucket | **Done** |
 | Threshold-based entry rules | Not implemented | **Missing** |
 | Fee-adjusted profitability | Not implemented | **Missing** |
 | Entry/exit rule backtesting | Not implemented | **Missing** |

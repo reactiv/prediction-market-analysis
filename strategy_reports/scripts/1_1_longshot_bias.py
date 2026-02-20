@@ -11,7 +11,6 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
 import duckdb  # noqa: E402
-import numpy as np  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -35,7 +34,7 @@ PURPLE = "#9467bd"
 # Query: win rate by price (1-99)
 # ---------------------------------------------------------------------------
 def load_win_rates() -> dict:
-    """Return {price: {n, wins, win_rate}} for prices 1-99."""
+    """Return per-price trade and contract statistics for prices 1-99."""
     con = duckdb.connect()
     sql = f"""
     WITH resolved_markets AS (
@@ -47,21 +46,26 @@ def load_win_rates() -> dict:
         -- Taker side
         SELECT
             CASE WHEN t.taker_side = 'yes' THEN t.yes_price ELSE t.no_price END AS price,
-            CASE WHEN t.taker_side = m.result THEN 1 ELSE 0 END AS won
+            CASE WHEN t.taker_side = m.result THEN 1 ELSE 0 END AS won,
+            t.count AS contracts
         FROM '{TRADES_DIR}/*.parquet' t
         INNER JOIN resolved_markets m ON t.ticker = m.ticker
         UNION ALL
         -- Maker side (counterparty)
         SELECT
             CASE WHEN t.taker_side = 'yes' THEN t.no_price ELSE t.yes_price END AS price,
-            CASE WHEN t.taker_side != m.result THEN 1 ELSE 0 END AS won
+            CASE WHEN t.taker_side != m.result THEN 1 ELSE 0 END AS won,
+            t.count AS contracts
         FROM '{TRADES_DIR}/*.parquet' t
         INNER JOIN resolved_markets m ON t.ticker = m.ticker
     )
     SELECT price,
-        COUNT(*) AS n,
-        SUM(won) AS wins,
-        100.0 * SUM(won) / COUNT(*) AS win_rate
+        COUNT(*) AS n_trades,
+        SUM(contracts) AS n_contracts,
+        SUM(won) AS wins_trades,
+        SUM(won * contracts) AS wins_contracts,
+        100.0 * SUM(won) / COUNT(*) AS win_rate_trade,
+        100.0 * SUM(won * contracts) / SUM(contracts) AS win_rate_contract
     FROM all_positions
     WHERE price BETWEEN 1 AND 99
     GROUP BY price
@@ -71,11 +75,22 @@ def load_win_rates() -> dict:
     con.close()
 
     data = {}
-    for price, n, wins, win_rate in rows:
+    for (
+        price,
+        n_trades,
+        n_contracts,
+        wins_trades,
+        wins_contracts,
+        win_rate_trade,
+        win_rate_contract,
+    ) in rows:
         data[int(price)] = {
-            "n": int(n),
-            "wins": int(wins),
-            "win_rate": float(win_rate),
+            "n_trades": int(n_trades),
+            "n_contracts": int(n_contracts),
+            "wins_trades": int(wins_trades),
+            "wins_contracts": float(wins_contracts),
+            "win_rate_trade": float(win_rate_trade),
+            "win_rate_contract": float(win_rate_contract),
         }
     return data
 
@@ -86,8 +101,9 @@ def load_win_rates() -> dict:
 def compute_metrics(data: dict) -> dict:
     """
     For each price point compute:
-      - excess_return_pp = win_rate - price  (positive => buyers have edge)
-      - edge_cents = excess_return_pp  (same numerically; 1 pp = 1 cent/contract)
+      - excess_return_pp_contract = contract-weighted win_rate - price
+      - excess_return_pp_trade = trade-weighted win_rate - price
+      - edge_cents = excess_return_pp_contract (1 pp = 1 cent/contract)
       - For "fade longshot" strategy:
         If price < 15, the opposing side is at (100 - price) with
         win_rate_opposing = 100 - win_rate.  Compute their excess return.
@@ -97,26 +113,37 @@ def compute_metrics(data: dict) -> dict:
     results = {}
     for p in prices:
         d = data[p]
-        wr = d["win_rate"]
-        n = d["n"]
+        wr_contract = d["win_rate_contract"]
+        wr_trade = d["win_rate_trade"]
+        n_trades = d["n_trades"]
+        n_contracts = d["n_contracts"]
 
-        excess_return_pp = wr - p  # positive => buyers win more than price implies
-        edge_cents = excess_return_pp  # 1 pp = 1 cent per contract
+        excess_return_pp_contract = wr_contract - p
+        excess_return_pp_trade = wr_trade - p
+        edge_cents = excess_return_pp_contract  # 1 pp = 1 cent per contract
 
         # Fade-longshot metrics: what does the OTHER side earn?
         opp_price = 100 - p
-        opp_wr = 100.0 - wr
-        opp_excess_pp = opp_wr - opp_price  # = -(wr - p) = -excess_return_pp
+        opp_wr_contract = 100.0 - wr_contract
+        opp_wr_trade = 100.0 - wr_trade
+        opp_excess_pp_contract = opp_wr_contract - opp_price
+        opp_excess_pp_trade = opp_wr_trade - opp_price
 
         results[p] = {
-            "n": n,
-            "wins": d["wins"],
-            "win_rate": wr,
-            "excess_return_pp": excess_return_pp,
+            "n_trades": n_trades,
+            "n_contracts": n_contracts,
+            "wins_trades": d["wins_trades"],
+            "wins_contracts": d["wins_contracts"],
+            "win_rate_trade": wr_trade,
+            "win_rate_contract": wr_contract,
+            "excess_return_pp_contract": excess_return_pp_contract,
+            "excess_return_pp_trade": excess_return_pp_trade,
             "edge_cents": edge_cents,
             "opp_price": opp_price,
-            "opp_win_rate": opp_wr,
-            "opp_excess_pp": opp_excess_pp,
+            "opp_win_rate_contract": opp_wr_contract,
+            "opp_win_rate_trade": opp_wr_trade,
+            "opp_excess_pp_contract": opp_excess_pp_contract,
+            "opp_excess_pp_trade": opp_excess_pp_trade,
         }
     return results
 
@@ -130,21 +157,30 @@ def bucket_calibration(data: dict, bucket_width: int = 5, min_obs: int = 100) ->
     for p, d in data.items():
         mid = (p // bucket_width) * bucket_width + bucket_width / 2.0
         if mid not in buckets:
-            buckets[mid] = {"n": 0, "wins": 0}
-        buckets[mid]["n"] += d["n"]
-        buckets[mid]["wins"] += d["wins"]
+            buckets[mid] = {
+                "n_trades": 0,
+                "n_contracts": 0,
+                "wins_contracts": 0.0,
+                "price_contract_weighted_sum": 0.0,
+            }
+        buckets[mid]["n_trades"] += d["n_trades"]
+        buckets[mid]["n_contracts"] += d["n_contracts"]
+        buckets[mid]["wins_contracts"] += d["wins_contracts"]
+        buckets[mid]["price_contract_weighted_sum"] += p * d["n_contracts"]
 
     result = []
     for mid in sorted(buckets.keys()):
         b = buckets[mid]
-        if b["n"] >= min_obs:
-            wr = 100.0 * b["wins"] / b["n"]
+        if b["n_trades"] >= min_obs and b["n_contracts"] > 0:
+            wr = 100.0 * b["wins_contracts"] / b["n_contracts"]
+            avg_price = b["price_contract_weighted_sum"] / b["n_contracts"]
             result.append({
-                "bucket": mid,
-                "n": b["n"],
-                "wins": b["wins"],
-                "win_rate": wr,
-                "excess_return_pp": wr - mid,
+                "bucket_mid": mid,
+                "avg_price": avg_price,
+                "n_trades": b["n_trades"],
+                "n_contracts": b["n_contracts"],
+                "win_rate_contract": wr,
+                "excess_return_pp_contract": wr - avg_price,
             })
     return result
 
@@ -154,8 +190,8 @@ def bucket_calibration(data: dict, bucket_width: int = 5, min_obs: int = 100) ->
 # ---------------------------------------------------------------------------
 def plot_excess_returns(metrics: dict) -> None:
     prices = sorted(metrics.keys())
-    excess = [metrics[p]["excess_return_pp"] for p in prices]
-    n_obs = [metrics[p]["n"] for p in prices]
+    excess = [metrics[p]["excess_return_pp_contract"] for p in prices]
+    n_obs = [metrics[p]["n_trades"] for p in prices]
 
     # Filter out prices with < 100 observations
     filtered_prices = []
@@ -204,8 +240,8 @@ def plot_excess_returns(metrics: dict) -> None:
 # Figure 2: Calibration with Longshot Regions
 # ---------------------------------------------------------------------------
 def plot_calibration(buckets: list[dict]) -> None:
-    bucket_mids = [b["bucket"] for b in buckets]
-    win_rates = [b["win_rate"] for b in buckets]
+    bucket_prices = [b["avg_price"] for b in buckets]
+    win_rates = [b["win_rate_contract"] for b in buckets]
 
     fig, ax = plt.subplots(figsize=(12, 7), facecolor="white")
 
@@ -223,18 +259,18 @@ def plot_calibration(buckets: list[dict]) -> None:
     # Calibration points
     # Color longshot/favorite buckets differently
     for b in buckets:
-        mid = b["bucket"]
-        wr = b["win_rate"]
-        if mid < 15:
+        x = b["avg_price"]
+        wr = b["win_rate_contract"]
+        if x < 15:
             color = RED
-        elif mid > 85:
+        elif x > 85:
             color = ORANGE
         else:
             color = BLUE
-        ax.scatter(mid, wr, color=color, s=60, zorder=5, edgecolors="white", linewidth=0.5)
+        ax.scatter(x, wr, color=color, s=60, zorder=5, edgecolors="white", linewidth=0.5)
 
     # Connect with line
-    ax.plot(bucket_mids, win_rates, color=BLUE, linewidth=1.5, alpha=0.7)
+    ax.plot(bucket_prices, win_rates, color=BLUE, linewidth=1.5, alpha=0.7)
 
     ax.set_xlabel("Contract Price (cents)", fontsize=12)
     ax.set_ylabel("Win Rate (%)", fontsize=12)
@@ -258,28 +294,37 @@ def build_summary(metrics: dict, buckets: list[dict]) -> dict:
     """Build JSON summary with key stats."""
 
     # Overall stats for longshot zone (<15c buyers)
-    longshot_prices = [p for p in metrics if p < 15 and metrics[p]["n"] >= 100]
-    favorite_prices = [p for p in metrics if p > 85 and metrics[p]["n"] >= 100]
+    longshot_prices = [p for p in metrics if p < 15 and metrics[p]["n_trades"] >= 100]
+    favorite_prices = [p for p in metrics if p > 85 and metrics[p]["n_trades"] >= 100]
 
     def zone_stats(price_list, label):
         if not price_list:
             return {"zone": label, "n_prices": 0}
-        total_n = sum(metrics[p]["n"] for p in price_list)
-        total_wins = sum(metrics[p]["wins"] for p in price_list)
-        weighted_excess = sum(
-            metrics[p]["excess_return_pp"] * metrics[p]["n"] for p in price_list
-        ) / total_n
-        avg_win_rate = 100.0 * total_wins / total_n
-        avg_price = sum(p * metrics[p]["n"] for p in price_list) / total_n
+        total_trades = sum(metrics[p]["n_trades"] for p in price_list)
+        total_contracts = sum(metrics[p]["n_contracts"] for p in price_list)
+        total_wins_trade = sum(metrics[p]["wins_trades"] for p in price_list)
+        total_wins_contract = sum(metrics[p]["wins_contracts"] for p in price_list)
+        weighted_excess_contract = sum(
+            metrics[p]["excess_return_pp_contract"] * metrics[p]["n_contracts"] for p in price_list
+        ) / total_contracts
+        weighted_excess_trade = sum(
+            metrics[p]["excess_return_pp_trade"] * metrics[p]["n_trades"] for p in price_list
+        ) / total_trades
+        avg_win_rate_contract = 100.0 * total_wins_contract / total_contracts
+        avg_win_rate_trade = 100.0 * total_wins_trade / total_trades
+        avg_price_contract = sum(p * metrics[p]["n_contracts"] for p in price_list) / total_contracts
         return {
             "zone": label,
             "price_range": f"{min(price_list)}-{max(price_list)}c",
             "n_prices": len(price_list),
-            "total_trades": total_n,
-            "avg_price": round(avg_price, 2),
-            "avg_win_rate": round(avg_win_rate, 2),
-            "weighted_excess_return_pp": round(weighted_excess, 2),
-            "edge_cents_per_contract": round(weighted_excess, 2),
+            "total_trades": total_trades,
+            "total_contracts": total_contracts,
+            "avg_price_cents_contract_weighted": round(avg_price_contract, 2),
+            "avg_win_rate_pct_contract_weighted": round(avg_win_rate_contract, 2),
+            "avg_win_rate_pct_trade_weighted": round(avg_win_rate_trade, 2),
+            "weighted_excess_return_pp_contract_weighted": round(weighted_excess_contract, 2),
+            "weighted_excess_return_pp_trade_weighted": round(weighted_excess_trade, 2),
+            "edge_cents_per_contract": round(weighted_excess_contract, 2),
         }
 
     longshot_stats = zone_stats(longshot_prices, "longshot (<15c)")
@@ -288,20 +333,20 @@ def build_summary(metrics: dict, buckets: list[dict]) -> dict:
     # Fade-longshot strategy: take the OPPOSING side when someone buys at <15c
     # i.e., you are selling YES at price <15c, or equivalently buying NO at (100-price)
     # Your edge = opp_excess_pp for that price
-    fade_longshot_prices = [p for p in metrics if p < 15 and metrics[p]["n"] >= 100]
+    fade_longshot_prices = [p for p in metrics if p < 15 and metrics[p]["n_trades"] >= 100]
     if fade_longshot_prices:
-        total_n = sum(metrics[p]["n"] for p in fade_longshot_prices)
+        total_contracts = sum(metrics[p]["n_contracts"] for p in fade_longshot_prices)
         weighted_fade_edge = sum(
-            metrics[p]["opp_excess_pp"] * metrics[p]["n"] for p in fade_longshot_prices
-        ) / total_n
+            metrics[p]["opp_excess_pp_contract"] * metrics[p]["n_contracts"] for p in fade_longshot_prices
+        ) / total_contracts
         fade_win_rate = sum(
-            metrics[p]["opp_win_rate"] * metrics[p]["n"] for p in fade_longshot_prices
-        ) / total_n
+            metrics[p]["opp_win_rate_contract"] * metrics[p]["n_contracts"] for p in fade_longshot_prices
+        ) / total_contracts
         fade_longshot = {
             "strategy": "fade_longshot",
             "description": "Bet AGAINST contracts priced <15c (buy NO / sell YES)",
-            "total_trades": total_n,
-            "avg_opposing_price": round(sum((100 - p) * metrics[p]["n"] for p in fade_longshot_prices) / total_n, 2),
+            "total_contracts": total_contracts,
+            "avg_opposing_price": round(sum((100 - p) * metrics[p]["n_contracts"] for p in fade_longshot_prices) / total_contracts, 2),
             "avg_win_rate": round(fade_win_rate, 2),
             "weighted_edge_pp": round(weighted_fade_edge, 2),
             "edge_cents_per_contract": round(weighted_fade_edge, 2),
@@ -310,20 +355,20 @@ def build_summary(metrics: dict, buckets: list[dict]) -> dict:
         fade_longshot = {"strategy": "fade_longshot", "total_trades": 0}
 
     # Fade-favorite strategy: take the OPPOSING side when someone buys at >85c
-    fade_favorite_prices = [p for p in metrics if p > 85 and metrics[p]["n"] >= 100]
+    fade_favorite_prices = [p for p in metrics if p > 85 and metrics[p]["n_trades"] >= 100]
     if fade_favorite_prices:
-        total_n = sum(metrics[p]["n"] for p in fade_favorite_prices)
+        total_contracts = sum(metrics[p]["n_contracts"] for p in fade_favorite_prices)
         weighted_fade_edge = sum(
-            metrics[p]["opp_excess_pp"] * metrics[p]["n"] for p in fade_favorite_prices
-        ) / total_n
+            metrics[p]["opp_excess_pp_contract"] * metrics[p]["n_contracts"] for p in fade_favorite_prices
+        ) / total_contracts
         fade_win_rate = sum(
-            metrics[p]["opp_win_rate"] * metrics[p]["n"] for p in fade_favorite_prices
-        ) / total_n
+            metrics[p]["opp_win_rate_contract"] * metrics[p]["n_contracts"] for p in fade_favorite_prices
+        ) / total_contracts
         fade_favorite = {
             "strategy": "fade_favorite",
             "description": "Bet AGAINST contracts priced >85c (buy NO when price >85c)",
-            "total_trades": total_n,
-            "avg_opposing_price": round(sum((100 - p) * metrics[p]["n"] for p in fade_favorite_prices) / total_n, 2),
+            "total_contracts": total_contracts,
+            "avg_opposing_price": round(sum((100 - p) * metrics[p]["n_contracts"] for p in fade_favorite_prices) / total_contracts, 2),
             "avg_win_rate": round(fade_win_rate, 2),
             "weighted_edge_pp": round(weighted_fade_edge, 2),
             "edge_cents_per_contract": round(weighted_fade_edge, 2),
@@ -332,12 +377,12 @@ def build_summary(metrics: dict, buckets: list[dict]) -> dict:
         fade_favorite = {"strategy": "fade_favorite", "total_trades": 0}
 
     # Breakeven: find price points where excess_return crosses zero
-    sorted_prices = sorted(p for p in metrics if metrics[p]["n"] >= 100)
+    sorted_prices = sorted(p for p in metrics if metrics[p]["n_trades"] >= 100)
     breakevens = []
     for i in range(len(sorted_prices) - 1):
         p1, p2 = sorted_prices[i], sorted_prices[i + 1]
-        e1 = metrics[p1]["excess_return_pp"]
-        e2 = metrics[p2]["excess_return_pp"]
+        e1 = metrics[p1]["excess_return_pp_contract"]
+        e2 = metrics[p2]["excess_return_pp_contract"]
         if e1 * e2 < 0:  # sign change
             # Linear interpolation
             bp = p1 + (p2 - p1) * abs(e1) / (abs(e1) + abs(e2))
@@ -349,11 +394,13 @@ def build_summary(metrics: dict, buckets: list[dict]) -> dict:
         m = metrics[p]
         longshot_detail.append({
             "price": p,
-            "n": m["n"],
-            "win_rate": round(m["win_rate"], 2),
-            "excess_return_pp": round(m["excess_return_pp"], 2),
-            "opposing_win_rate": round(m["opp_win_rate"], 2),
-            "opposing_excess_pp": round(m["opp_excess_pp"], 2),
+            "n_trades": m["n_trades"],
+            "n_contracts": m["n_contracts"],
+            "win_rate_contract": round(m["win_rate_contract"], 2),
+            "win_rate_trade": round(m["win_rate_trade"], 2),
+            "excess_return_pp_contract": round(m["excess_return_pp_contract"], 2),
+            "opposing_win_rate_contract": round(m["opp_win_rate_contract"], 2),
+            "opposing_excess_pp_contract": round(m["opp_excess_pp_contract"], 2),
         })
 
     favorite_detail = []
@@ -361,34 +408,39 @@ def build_summary(metrics: dict, buckets: list[dict]) -> dict:
         m = metrics[p]
         favorite_detail.append({
             "price": p,
-            "n": m["n"],
-            "win_rate": round(m["win_rate"], 2),
-            "excess_return_pp": round(m["excess_return_pp"], 2),
-            "opposing_win_rate": round(m["opp_win_rate"], 2),
-            "opposing_excess_pp": round(m["opp_excess_pp"], 2),
+            "n_trades": m["n_trades"],
+            "n_contracts": m["n_contracts"],
+            "win_rate_contract": round(m["win_rate_contract"], 2),
+            "win_rate_trade": round(m["win_rate_trade"], 2),
+            "excess_return_pp_contract": round(m["excess_return_pp_contract"], 2),
+            "opposing_win_rate_contract": round(m["opp_win_rate_contract"], 2),
+            "opposing_excess_pp_contract": round(m["opp_excess_pp_contract"], 2),
         })
 
     # Bucket-level summary for report table
     bucket_table = []
     for b in buckets:
-        mid = b["bucket"]
-        if mid <= 15 or mid >= 85:
+        bucket_price = b["avg_price"]
+        if bucket_price <= 15 or bucket_price >= 85:
             bucket_table.append({
-                "bucket": mid,
-                "n": b["n"],
-                "win_rate": round(b["win_rate"], 2),
-                "implied_prob": mid,
-                "excess_return_pp": round(b["excess_return_pp"], 2),
-                "edge_cents": round(b["excess_return_pp"], 2),
+                "bucket_mid": b["bucket_mid"],
+                "avg_price_cents": round(bucket_price, 2),
+                "n_trades": b["n_trades"],
+                "n_contracts": b["n_contracts"],
+                "win_rate_contract": round(b["win_rate_contract"], 2),
+                "implied_prob_contract_weighted": round(bucket_price, 2),
+                "excess_return_pp_contract": round(b["excess_return_pp_contract"], 2),
+                "edge_cents_per_contract": round(b["excess_return_pp_contract"], 2),
             })
 
-    # Total trades
-    total_trades = sum(metrics[p]["n"] for p in metrics)
+    total_trades = sum(metrics[p]["n_trades"] for p in metrics)
+    total_contracts = sum(metrics[p]["n_contracts"] for p in metrics)
 
     summary = {
         "total_trades": total_trades,
+        "total_contracts": total_contracts,
         "total_prices_with_data": len(metrics),
-        "prices_with_100_obs": len([p for p in metrics if metrics[p]["n"] >= 100]),
+        "prices_with_100_obs": len([p for p in metrics if metrics[p]["n_trades"] >= 100]),
         "longshot_zone": longshot_stats,
         "favorite_zone": favorite_stats,
         "fade_longshot_strategy": fade_longshot,

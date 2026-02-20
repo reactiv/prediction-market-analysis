@@ -2,8 +2,8 @@
 
 Computes daily calibration metrics (MAE between win rate and implied probability)
 across rolling windows (7d, 30d, 90d), broken down by category, price bucket,
-and time-to-expiry bucket. Produces regime flags when short-term calibration
-diverges from long-term, and resolution lag statistics per category.
+time-to-expiry bucket, and taker side. The feature date is the *resolution date*
+(`close_time`) to avoid using future outcomes at trade time.
 """
 
 from __future__ import annotations
@@ -49,7 +49,11 @@ class T6RollingCalibration(Transform):
         )
 
     def _build_daily_aggregates(self) -> pd.DataFrame:
-        """Step 1+2: Join trades with resolved markets and aggregate to daily level."""
+        """Step 1+2: Join trades with resolved markets and aggregate by resolution day.
+
+        Using resolution day (`close_time`) keeps features causal: a row for date D
+        only depends on outcomes that were known by D.
+        """
         trades_glob = str(self.base_dir / "data" / "kalshi" / "trades" / "*.parquet")
         markets_glob = str(self.base_dir / "data" / "kalshi" / "markets" / "*.parquet")
 
@@ -98,7 +102,7 @@ class T6RollingCalibration(Transform):
                         ELSE '7d+'
                     END AS tte_bucket,
                     CASE WHEN t.taker_side = m.result THEN 1 ELSE 0 END AS won,
-                    DATE_TRUNC('day', t.created_time) AS trade_date,
+                    DATE_TRUNC('day', m.close_time) AS trade_date,
                     EPOCH(m.close_time - t.created_time) AS tte_seconds
                 FROM trades t
                 INNER JOIN resolved_markets m ON t.ticker = m.ticker
@@ -108,6 +112,7 @@ class T6RollingCalibration(Transform):
                 category,
                 price_bucket,
                 tte_bucket,
+                taker_side,
                 SUM(count) AS total_trades,
                 SUM(won * count) AS total_wins,
                 SUM(won * count) * 1.0 / SUM(count) AS win_rate,
@@ -117,8 +122,8 @@ class T6RollingCalibration(Transform):
                 SUM(count) AS total_volume,
                 AVG(tte_seconds) AS avg_tte_seconds
             FROM resolved_trades
-            GROUP BY trade_date, category, price_bucket, tte_bucket
-            ORDER BY trade_date, category, price_bucket, tte_bucket
+            GROUP BY trade_date, category, price_bucket, tte_bucket, taker_side
+            ORDER BY trade_date, category, price_bucket, tte_bucket, taker_side
         """
 
         daily_df = con.execute(query).fetchdf()
@@ -143,106 +148,13 @@ class T6RollingCalibration(Transform):
         return daily_df
 
     def _compute_rolling_features(self, daily_df: pd.DataFrame) -> pd.DataFrame:
-        """Step 3: Compute rolling calibration metrics per (date, category)."""
-        categories = daily_df["category"].unique()
+        """Step 3: Compute rolling metrics per full T6 cell.
 
-        # Pre-aggregate to (date, category) level for rolling MAE and yes-ratio
-        # We need the full granularity for the output, but rolling is at category level
-        cat_date_agg = (
-            daily_df.groupby(["trade_date", "category"])
-            .agg(
-                total_trades=("total_trades", "sum"),
-                total_wins=("total_wins", "sum"),
-                # Weighted absolute calibration error components
-                weighted_abs_error=(
-                    "calibration_error",
-                    lambda x: (
-                        x * daily_df.loc[x.index, "total_trades"]
-                    ).sum(),
-                ),
-                yes_taker_sum=("yes_taker_count", "sum"),
-                volume_sum=("total_volume", "sum"),
-            )
-            .reset_index()
-        )
-
-        # Compute weighted MAE at category-date level
-        cat_date_agg["wmae"] = (
-            cat_date_agg["weighted_abs_error"] / cat_date_agg["total_trades"]
-        )
-        cat_date_agg["yes_ratio"] = (
-            cat_date_agg["yes_taker_sum"] / cat_date_agg["total_trades"]
-        )
-
-        # For each category, compute rolling metrics over dates
-        rolling_metrics = {}
-
-        for cat in categories:
-            cdf = (
-                cat_date_agg[cat_date_agg["category"] == cat]
-                .sort_values("trade_date")
-                .set_index("trade_date")
-            )
-
-            if len(cdf) == 0:
-                continue
-
-            for window_days in [7, 30, 90]:
-                window_str = f"{window_days}D"
-                col_suffix = f"_{window_days}d"
-
-                # Rolling weighted MAE: sum(weighted_abs_error) / sum(total_trades)
-                roll_weighted_err = cdf["weighted_abs_error"].rolling(
-                    window_str, min_periods=1
-                ).sum()
-                roll_total_trades = cdf["total_trades"].rolling(
-                    window_str, min_periods=1
-                ).sum()
-                cdf[f"mae{col_suffix}"] = roll_weighted_err / roll_total_trades
-
-                # Rolling yes ratio
-                roll_yes = cdf["yes_taker_sum"].rolling(
-                    window_str, min_periods=1
-                ).sum()
-                cdf[f"yes_ratio{col_suffix}"] = roll_yes / roll_total_trades
-
-                # Rolling volume
-                cdf[f"volume{col_suffix}"] = cdf["volume_sum"].rolling(
-                    window_str, min_periods=1
-                ).sum()
-
-            # Opportunity score: MAE * log(volume) * (1 + abs(yes_ratio - 0.5))
-            # Use 7d window for the score
-            cdf["opportunity_score"] = (
-                cdf["mae_7d"]
-                * np.log1p(cdf["volume_7d"])
-                * (1 + np.abs(cdf["yes_ratio_7d"] - 0.5))
-            )
-
-            rolling_metrics[cat] = cdf.reset_index()
-
-        if rolling_metrics:
-            rolling_df = pd.concat(rolling_metrics.values(), ignore_index=True)
-        else:
-            rolling_df = pd.DataFrame()
-
-        # Merge rolling metrics back to the full daily granularity
-        if not rolling_df.empty:
-            merge_cols = [
-                "trade_date",
-                "category",
-                "mae_7d",
-                "mae_30d",
-                "mae_90d",
-                "opportunity_score",
-                "yes_ratio_7d",
-            ]
-            features_df = daily_df.merge(
-                rolling_df[merge_cols],
-                on=["trade_date", "category"],
-                how="left",
-            )
-        else:
+        Rolling windows are computed per
+        (category, price_bucket, tte_bucket, taker_side) to preserve
+        signal granularity and avoid side mixing.
+        """
+        if daily_df.empty:
             features_df = daily_df.copy()
             for col in [
                 "mae_7d",
@@ -252,6 +164,43 @@ class T6RollingCalibration(Transform):
                 "yes_ratio_7d",
             ]:
                 features_df[col] = np.nan
+        else:
+            group_cols = ["category", "price_bucket", "tte_bucket", "taker_side"]
+            rolling_parts: list[pd.DataFrame] = []
+
+            for _, cell_df in daily_df.groupby(group_cols, sort=False):
+                cdf = cell_df.sort_values("trade_date").copy().set_index("trade_date")
+                weighted_abs_error = cdf["calibration_error"] * cdf["total_trades"]
+
+                for window_days in [7, 30, 90]:
+                    window_str = f"{window_days}D"
+                    col_suffix = f"_{window_days}d"
+
+                    roll_total_trades = cdf["total_trades"].rolling(
+                        window_str, min_periods=1
+                    ).sum()
+                    roll_weighted_err = weighted_abs_error.rolling(
+                        window_str, min_periods=1
+                    ).sum()
+                    cdf[f"mae{col_suffix}"] = roll_weighted_err / roll_total_trades
+
+                    roll_yes = cdf["yes_taker_count"].rolling(
+                        window_str, min_periods=1
+                    ).sum()
+                    cdf[f"yes_ratio{col_suffix}"] = roll_yes / roll_total_trades
+
+                    cdf[f"volume{col_suffix}"] = cdf["total_volume"].rolling(
+                        window_str, min_periods=1
+                    ).sum()
+
+                cdf["opportunity_score"] = (
+                    cdf["mae_7d"]
+                    * np.log1p(cdf["volume_7d"])
+                    * (1 + np.abs(cdf["yes_ratio_7d"] - 0.5))
+                )
+                rolling_parts.append(cdf.reset_index())
+
+            features_df = pd.concat(rolling_parts, ignore_index=True)
 
         # Select output columns
         output_cols = [
@@ -259,6 +208,7 @@ class T6RollingCalibration(Transform):
             "category",
             "price_bucket",
             "tte_bucket",
+            "taker_side",
             "total_trades",
             "total_wins",
             "win_rate",
@@ -278,6 +228,9 @@ class T6RollingCalibration(Transform):
         output_cols = [c if c != "total_volume" else "volume" for c in output_cols]
 
         features_df = features_df[output_cols]
+        features_df = features_df.sort_values(
+            ["trade_date", "category", "price_bucket", "tte_bucket", "taker_side"]
+        ).reset_index(drop=True)
 
         # Write daily features
         output_path = self.output_dir / "daily_features.parquet"
@@ -287,11 +240,15 @@ class T6RollingCalibration(Transform):
 
     def _compute_regime_flags(self, features_df: pd.DataFrame) -> None:
         """Step 4: Regime flags when 7d MAE crosses above/below 90d MAE."""
+        key_cols = ["category", "price_bucket", "tte_bucket", "taker_side"]
         if features_df.empty:
             regime_df = pd.DataFrame(
                 columns=[
                     "trade_date",
                     "category",
+                    "price_bucket",
+                    "tte_bucket",
+                    "taker_side",
                     "mae_7d",
                     "mae_90d",
                     "regime_flag",
@@ -302,12 +259,12 @@ class T6RollingCalibration(Transform):
             )
             return
 
-        # Get unique (trade_date, category) with their rolling MAEs
+        # Get unique cell/date rows with their rolling MAEs
         regime_df = (
-            features_df.groupby(["trade_date", "category"])
+            features_df.groupby(["trade_date", *key_cols])
             .agg(mae_7d=("mae_7d", "first"), mae_90d=("mae_90d", "first"))
             .reset_index()
-            .sort_values(["category", "trade_date"])
+            .sort_values([*key_cols, "trade_date"])
         )
 
         # Compute regime flag: 1 when 7d > 90d, -1 when 7d < 90d, 0 at start
@@ -326,7 +283,7 @@ class T6RollingCalibration(Transform):
             return group
 
         regime_df = (
-            regime_df.groupby("category", group_keys=False)
+            regime_df.groupby(key_cols, group_keys=False)
             .apply(compute_flag)
             .reset_index(drop=True)
         )
@@ -334,6 +291,9 @@ class T6RollingCalibration(Transform):
         output_cols = [
             "trade_date",
             "category",
+            "price_bucket",
+            "tte_bucket",
+            "taker_side",
             "mae_7d",
             "mae_90d",
             "regime_flag",

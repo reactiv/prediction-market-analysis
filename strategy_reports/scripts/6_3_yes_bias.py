@@ -34,7 +34,7 @@ RED = "#e74c3c"
 def load_per_price_data() -> tuple[dict, dict]:
     """Return (yes_data, no_data) keyed by price (1-99).
 
-    Each value: {n_trades, total_contracts, wins, win_rate}
+    Each value includes trade counts and contract-weighted win metrics.
     """
     con = duckdb.connect()
 
@@ -59,6 +59,7 @@ def load_per_price_data() -> tuple[dict, dict]:
         price,
         COUNT(*)            AS n_trades,
         SUM(contracts)      AS total_contracts,
+        SUM(won * contracts) AS wins_contracts,
         SUM(won)            AS wins_unweighted
     FROM yes_takers
     GROUP BY price
@@ -87,6 +88,7 @@ def load_per_price_data() -> tuple[dict, dict]:
         price,
         COUNT(*)            AS n_trades,
         SUM(contracts)      AS total_contracts,
+        SUM(won * contracts) AS wins_contracts,
         SUM(won)            AS wins_unweighted
     FROM no_takers
     GROUP BY price
@@ -97,14 +99,16 @@ def load_per_price_data() -> tuple[dict, dict]:
 
     def parse(rows):
         data = {}
-        for price, n_trades, total_contracts, wins_uw in rows:
+        for price, n_trades, total_contracts, wins_contracts, wins_uw in rows:
             p = int(price)
             n = int(n_trades)
             data[p] = {
                 "n_trades": n,
                 "total_contracts": int(total_contracts),
+                "wins_contracts": float(wins_contracts),
                 "wins": int(wins_uw),
-                "win_rate": float(wins_uw) / n if n > 0 else 0.0,
+                "win_rate_trade": float(wins_uw) / n if n > 0 else 0.0,
+                "win_rate_contract": float(wins_contracts) / float(total_contracts) if total_contracts > 0 else 0.0,
             }
         return data
 
@@ -143,19 +147,27 @@ def bucket_data(data: dict, bucket_width: int = 5, min_obs: int = 100) -> list[d
     for p, d in data.items():
         mid = (p // bucket_width) * bucket_width + bucket_width / 2.0
         if mid not in buckets:
-            buckets[mid] = {"n_trades": 0, "total_contracts": 0, "wins": 0}
+            buckets[mid] = {
+                "n_trades": 0,
+                "total_contracts": 0,
+                "wins_contracts": 0.0,
+                "price_contract_weighted_sum": 0.0,
+            }
         buckets[mid]["n_trades"] += d["n_trades"]
         buckets[mid]["total_contracts"] += d["total_contracts"]
-        buckets[mid]["wins"] += d["wins"]
+        buckets[mid]["wins_contracts"] += d["wins_contracts"]
+        buckets[mid]["price_contract_weighted_sum"] += p * d["total_contracts"]
 
     result = []
     for mid in sorted(buckets.keys()):
         b = buckets[mid]
-        if b["n_trades"] >= min_obs:
-            wr = float(b["wins"]) / float(b["n_trades"])
-            expected = mid / 100.0
+        if b["n_trades"] >= min_obs and b["total_contracts"] > 0:
+            wr = float(b["wins_contracts"]) / float(b["total_contracts"])
+            avg_price_cents = float(b["price_contract_weighted_sum"]) / float(b["total_contracts"])
+            expected = avg_price_cents / 100.0
             result.append({
                 "bucket_mid": mid,
+                "avg_price_cents": avg_price_cents,
                 "n_trades": b["n_trades"],
                 "total_contracts": b["total_contracts"],
                 "win_rate": wr,
@@ -210,13 +222,13 @@ def plot_calibration_asymmetry(yes_buckets: list[dict], no_buckets: list[dict]) 
     ax.axhline(0, color="gray", linewidth=1.5, linestyle="--", label="Fair pricing (0)")
 
     # YES takers
-    yes_x = [b["bucket_mid"] for b in yes_buckets]
+    yes_x = [b["avg_price_cents"] for b in yes_buckets]
     yes_y = [b["excess_return"] * 100 for b in yes_buckets]  # in percentage points
     ax.plot(yes_x, yes_y, color=GREEN, linewidth=2.5, marker="o",
             markersize=6, label="YES takers excess return", zorder=5)
 
     # NO takers
-    no_x = [b["bucket_mid"] for b in no_buckets]
+    no_x = [b["avg_price_cents"] for b in no_buckets]
     no_y = [b["excess_return"] * 100 for b in no_buckets]
     ax.plot(no_x, no_y, color=RED, linewidth=2.5, marker="s",
             markersize=6, label="NO takers excess return", zorder=5)
@@ -227,7 +239,7 @@ def plot_calibration_asymmetry(yes_buckets: list[dict], no_buckets: list[dict]) 
     if common_x:
         yes_dict = dict(zip(yes_x, yes_y))
         no_dict = dict(zip(no_x, no_y))
-        cx = [x for x in common_x]
+        cx = list(common_x)
         cy_yes = [yes_dict[x] for x in cx]
         cy_no = [no_dict[x] for x in cx]
         ax.fill_between(cx, cy_yes, cy_no, alpha=0.1, color="purple", label="Asymmetry gap")
@@ -249,8 +261,7 @@ def plot_calibration_asymmetry(yes_buckets: list[dict], no_buckets: list[dict]) 
 # ---------------------------------------------------------------------------
 # Summary table by price range
 # ---------------------------------------------------------------------------
-def build_range_table(yes_data: dict, no_data: dict,
-                      yes_buckets: list[dict], no_buckets: list[dict]) -> list[dict]:
+def build_range_table(yes_data: dict, no_data: dict) -> list[dict]:
     """Build a table with aggregated price ranges."""
     ranges = [
         ("1-10", 1, 10),
@@ -272,18 +283,26 @@ def build_range_table(yes_data: dict, no_data: dict,
         no_trades = sum(no_data.get(p, {}).get("n_trades", 0) for p in range(lo, hi + 1))
         ratio = yes_trades / no_trades if no_trades > 0 else float("inf")
 
-        # Get excess returns from bucketed data
-        def excess_for_range(buckets, lo_bound, hi_bound):
-            matching = [b for b in buckets if lo_bound <= b["bucket_mid"] <= hi_bound]
-            if not matching:
+        # Compute exact (contract-weighted) excess returns over raw price points
+        def excess_for_range(data, lo_bound, hi_bound):
+            total_contracts = 0
+            total_wins_contracts = 0.0
+            total_price_contract_weighted = 0.0
+            for p in range(lo_bound, hi_bound + 1):
+                d = data.get(p)
+                if d is None:
+                    continue
+                total_contracts += d["total_contracts"]
+                total_wins_contracts += d["wins_contracts"]
+                total_price_contract_weighted += p * d["total_contracts"]
+            if total_contracts == 0:
                 return None
-            total_n = sum(b["n_trades"] for b in matching)
-            if total_n == 0:
-                return None
-            return sum(b["excess_return"] * b["n_trades"] for b in matching) / total_n
+            win_rate = total_wins_contracts / total_contracts
+            expected = (total_price_contract_weighted / total_contracts) / 100.0
+            return win_rate - expected
 
-        yes_excess = excess_for_range(yes_buckets, lo, hi)
-        no_excess = excess_for_range(no_buckets, lo, hi)
+        yes_excess = excess_for_range(yes_data, lo, hi)
+        no_excess = excess_for_range(no_data, lo, hi)
 
         gap = None
         if yes_excess is not None and no_excess is not None:
@@ -316,14 +335,22 @@ def build_summary(yes_data: dict, no_data: dict,
 
     overall_ratio = yes_total / no_total if no_total > 0 else float("inf")
 
-    def weighted_avg_excess(buckets):
-        total_n = sum(b["n_trades"] for b in buckets)
-        if total_n == 0:
+    def weighted_avg_excess(data):
+        total_contracts = 0
+        total_wins_contracts = 0.0
+        total_price_contract_weighted = 0.0
+        for p, d in data.items():
+            total_contracts += d["total_contracts"]
+            total_wins_contracts += d["wins_contracts"]
+            total_price_contract_weighted += p * d["total_contracts"]
+        if total_contracts == 0:
             return 0.0
-        return sum(b["excess_return"] * b["n_trades"] for b in buckets) / total_n
+        win_rate = total_wins_contracts / total_contracts
+        expected = (total_price_contract_weighted / total_contracts) / 100.0
+        return win_rate - expected
 
-    yes_avg_excess = weighted_avg_excess(yes_buckets)
-    no_avg_excess = weighted_avg_excess(no_buckets)
+    yes_avg_excess = weighted_avg_excess(yes_data)
+    no_avg_excess = weighted_avg_excess(no_data)
 
     # Median and max volume ratio
     ratios = [v["ratio"] for v in volume_ratio]
@@ -334,14 +361,21 @@ def build_summary(yes_data: dict, no_data: dict,
     # Top 5 prices by ratio
     top5_ratio = sorted(volume_ratio, key=lambda v: v["ratio"], reverse=True)[:5]
 
-    range_table = build_range_table(yes_data, no_data, yes_buckets, no_buckets)
+    range_table = build_range_table(yes_data, no_data)
 
     # MAE for each side
-    def mae(buckets):
-        total_n = sum(b["n_trades"] for b in buckets)
-        if total_n == 0:
+    def mae(data):
+        total_contracts = 0
+        weighted_abs_err = 0.0
+        for p, d in data.items():
+            if d["total_contracts"] <= 0:
+                continue
+            err = abs(d["win_rate_contract"] - (p / 100.0))
+            weighted_abs_err += err * d["total_contracts"]
+            total_contracts += d["total_contracts"]
+        if total_contracts == 0:
             return 0.0
-        return sum(abs(b["excess_return"]) * b["n_trades"] for b in buckets) / total_n
+        return weighted_abs_err / total_contracts
 
     summary = {
         "overall": {
@@ -364,14 +398,16 @@ def build_summary(yes_data: dict, no_data: dict,
             "yes_weighted_avg_pp": round(yes_avg_excess * 100, 4),
             "no_weighted_avg_pp": round(no_avg_excess * 100, 4),
             "gap_pp": round((yes_avg_excess - no_avg_excess) * 100, 4),
-            "yes_mae_pp": round(mae(yes_buckets) * 100, 4),
-            "no_mae_pp": round(mae(no_buckets) * 100, 4),
+            "yes_mae_pp": round(mae(yes_data) * 100, 4),
+            "no_mae_pp": round(mae(no_data) * 100, 4),
         },
         "range_table": range_table,
         "yes_buckets": [
             {
                 "bucket_mid": b["bucket_mid"],
+                "avg_price_cents": round(b["avg_price_cents"], 4),
                 "n_trades": b["n_trades"],
+                "total_contracts": b["total_contracts"],
                 "win_rate": round(b["win_rate"], 6),
                 "expected": round(b["expected_win_rate"], 4),
                 "excess_return_pp": round(b["excess_return"] * 100, 4),
@@ -381,7 +417,9 @@ def build_summary(yes_data: dict, no_data: dict,
         "no_buckets": [
             {
                 "bucket_mid": b["bucket_mid"],
+                "avg_price_cents": round(b["avg_price_cents"], 4),
                 "n_trades": b["n_trades"],
+                "total_contracts": b["total_contracts"],
                 "win_rate": round(b["win_rate"], 6),
                 "expected": round(b["expected_win_rate"], 4),
                 "excess_return_pp": round(b["excess_return"] * 100, 4),

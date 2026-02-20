@@ -59,11 +59,12 @@ INNER JOIN read_parquet('{t6_path}') cal
   ON DATE_TRUNC('day', rt.timestamp) - INTERVAL '{lag_days} day' = cal.trade_date
   AND rt.category = cal.category
   AND FLOOR(rt.entry_price / 5) * 5 = cal.price_bucket
-  AND ({TTE_BUCKET_SQL}) = cal.tte_bucket"""
+  AND ({TTE_BUCKET_SQL}) = cal.tte_bucket
+  AND rt.taker_side = cal.taker_side"""
 
     where_clause = (
         f"entry_price < {max_price} "
-        f"AND taker_side = 'yes' "
+        f"AND rt.taker_side = 'yes' "
         f"AND cal.mae_7d > {min_mae_7d} "
         f"AND cal.total_trades >= {min_trades}"
     )

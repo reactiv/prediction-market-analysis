@@ -8,7 +8,7 @@ The optimal filtered market-making strategy on Kalshi combines four independent 
 ### Signal 1: Category Selection (from §1.3, §2.2)
 Maker excess return varies by a factor of 19x across categories. Entertainment leads at +2.06 pp per trade (4.12 pp maker-taker gap), followed by Weather (+1.68 pp), Crypto (+1.35 pp), and Sports (+1.23 pp). At the other extreme, Politics offers only +0.11 pp -- likely negative after fees -- and Finance is compressed at +0.58 pp.
 
-These findings are corroborated by the calibration analysis in §1.3: the worst-calibrated categories (Politics at 6.21 pp MAE, Science/Tech at 4.86 pp, Entertainment at 3.52 pp) are where prices deviate most from true probabilities. However, the miscalibration in Politics benefits directional traders rather than makers, because the taker population in Politics is unusually sophisticated. In contrast, Entertainment and Weather miscalibration flows directly into maker pockets because takers in those categories are casual and price-insensitive.
+These findings are corroborated by the calibration analysis in §1.3: the worst-calibrated categories (Politics at 13.11 pp MAE, Entertainment at 5.34 pp, Science/Tech at 3.69 pp) are where prices deviate most from true probabilities. However, the miscalibration in Politics benefits directional traders rather than makers, because the taker population in Politics is unusually sophisticated. In contrast, Entertainment and Weather miscalibration flows directly into maker pockets because takers in those categories are casual and price-insensitive.
 
 **Actionable filter:** Prioritize Sports (highest absolute PnL at $97.5M historically, 2.44 pp gap), Crypto (2.70 pp gap at meaningful volume), and Entertainment (4.12 pp gap, lower volume). De-prioritize or exclude Politics (+0.11 pp, likely negative net of fees) and treat Finance as marginal (+0.58 pp).
 
@@ -63,7 +63,7 @@ These filters are applied multiplicatively: a trade must pass all active gates t
 
 ## Key Recommendations
 
-- **Recommendation 1: Exclude Politics from the market-making universe.** The +0.11 pp maker edge in Politics is almost certainly negative after any reasonable fee structure. The high miscalibration in Politics (6.21 pp MAE) benefits directional traders, not makers, because the taker population is sophisticated. Capital allocated to Politics earns nearly zero gross edge while tying up inventory in a high-information-asymmetry environment.
+- **Recommendation 1: Exclude Politics from the market-making universe.** The +0.11 pp maker edge in Politics is almost certainly negative after any reasonable fee structure. The high miscalibration in Politics (13.11 pp MAE) benefits directional traders, not makers, because the taker population is sophisticated. Capital allocated to Politics earns nearly zero gross edge while tying up inventory in a high-information-asymmetry environment.
 
 - **Recommendation 2: Implement a systematic NO-side tilt with a 30--60c focus zone.** The single largest incremental signal is the +0.52 pp NO advantage over YES, which rises to +1.3--1.5 pp in the 30--60c price range. The market maker should quote the NO side 1--2 ticks tighter than the YES side in this range, and tolerate NO inventory accumulation up to a defined risk budget. This exploits the persistent taker YES bias without requiring a directional view on any specific event.
 

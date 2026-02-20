@@ -12,7 +12,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import duckdb  # noqa: E402
 import pandas as pd  # noqa: E402
-import numpy as np  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -44,9 +43,10 @@ def load_data(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
         WHERE status = 'finalized' AND result IN ('yes', 'no')
     ),
     market_trade_counts AS (
-        SELECT ticker, COUNT(*) AS total_trades, SUM(count) AS total_contracts
-        FROM '{TRADES_GLOB}'
-        GROUP BY ticker
+        SELECT t.ticker, COUNT(*) AS total_trades, SUM(t.count) AS total_contracts
+        FROM '{TRADES_GLOB}' t
+        INNER JOIN resolved_markets rm ON t.ticker = rm.ticker
+        GROUP BY t.ticker
     ),
     market_percentiles AS (
         SELECT
@@ -100,9 +100,10 @@ def load_regime_summary(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
         WHERE status = 'finalized' AND result IN ('yes', 'no')
     ),
     market_trade_counts AS (
-        SELECT ticker, COUNT(*) AS total_trades, SUM(count) AS total_contracts
-        FROM '{TRADES_GLOB}'
-        GROUP BY ticker
+        SELECT t.ticker, COUNT(*) AS total_trades, SUM(t.count) AS total_contracts
+        FROM '{TRADES_GLOB}' t
+        INNER JOIN resolved_markets rm ON t.ticker = rm.ticker
+        GROUP BY t.ticker
     ),
     market_percentiles AS (
         SELECT
@@ -145,10 +146,16 @@ def load_regime_summary(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
 def load_percentiles(con: duckdb.DuckDBPyConnection) -> dict:
     """Return the p33 and p67 percentile thresholds."""
     sql = f"""
-    WITH market_trade_counts AS (
-        SELECT ticker, COUNT(*) AS total_trades
-        FROM '{TRADES_GLOB}'
-        GROUP BY ticker
+    WITH resolved_markets AS (
+        SELECT ticker, result
+        FROM '{MARKETS_GLOB}'
+        WHERE status = 'finalized' AND result IN ('yes', 'no')
+    ),
+    market_trade_counts AS (
+        SELECT t.ticker, COUNT(*) AS total_trades
+        FROM '{TRADES_GLOB}' t
+        INNER JOIN resolved_markets rm ON t.ticker = rm.ticker
+        GROUP BY t.ticker
     )
     SELECT
         PERCENTILE_CONT(0.33) WITHIN GROUP (ORDER BY total_trades) AS p33,
@@ -165,18 +172,21 @@ def load_percentiles(con: duckdb.DuckDBPyConnection) -> dict:
 def bucket_calibration(df: pd.DataFrame, bucket_width: int = 5) -> pd.DataFrame:
     """Aggregate price-level data into wider buckets for smoother curves."""
     df = df.copy()
-    df["bucket"] = (df["price"] // bucket_width) * bucket_width + bucket_width / 2.0
+    df["bucket_mid"] = (df["price"] // bucket_width) * bucket_width + bucket_width / 2.0
+    df["price_weighted_trades"] = df["price"] * df["n_trades"]
     agg = (
-        df.groupby(["volume_regime", "regime_order", "bucket"], as_index=False)
+        df.groupby(["volume_regime", "regime_order", "bucket_mid"], as_index=False)
         .agg(
             n_trades=("n_trades", "sum"),
             total_contracts=("total_contracts", "sum"),
             # Weighted win rate: sum(win_rate * n_trades) / sum(n_trades)
             weighted_wins=("win_rate", lambda x: (x * df.loc[x.index, "n_trades"]).sum()),
+            weighted_price=("price_weighted_trades", "sum"),
         )
     )
     agg["win_rate"] = agg["weighted_wins"] / agg["n_trades"]
-    agg["expected"] = agg["bucket"] / 100.0
+    agg["avg_price_cents"] = agg["weighted_price"] / agg["n_trades"]
+    agg["expected"] = agg["avg_price_cents"] / 100.0
     agg["abs_error"] = (agg["win_rate"] - agg["expected"]).abs()
     agg["excess_return"] = agg["win_rate"] - agg["expected"]
     # Filter tiny buckets
@@ -184,17 +194,20 @@ def bucket_calibration(df: pd.DataFrame, bucket_width: int = 5) -> pd.DataFrame:
     return agg
 
 
-def compute_mae(bucketed: pd.DataFrame) -> pd.DataFrame:
-    """Weighted MAE per regime."""
-    bucketed = bucketed.copy()
-    bucketed["weighted_error"] = bucketed["abs_error"] * bucketed["n_trades"]
+def compute_mae(df: pd.DataFrame) -> pd.DataFrame:
+    """Weighted MAE per regime from exact price points (no bucket-midpoint approximation)."""
+    df = df.copy()
+    df["expected"] = df["price"] / 100.0
+    df["abs_error"] = (df["win_rate"] - df["expected"]).abs()
+    df["excess_return"] = df["win_rate"] - df["expected"]
+    df["weighted_error"] = df["abs_error"] * df["n_trades"]
     mae = (
-        bucketed.groupby(["volume_regime", "regime_order"], as_index=False)
+        df.groupby(["volume_regime", "regime_order"], as_index=False)
         .agg(
             total_trades=("n_trades", "sum"),
             weighted_error_sum=("weighted_error", "sum"),
-            n_buckets=("bucket", "count"),
-            avg_excess_return=("excess_return", lambda x: (x * bucketed.loc[x.index, "n_trades"]).sum() / bucketed.loc[x.index, "n_trades"].sum()),
+            n_price_points=("price", "count"),
+            avg_excess_return=("excess_return", lambda x: (x * df.loc[x.index, "n_trades"]).sum() / df.loc[x.index, "n_trades"].sum()),
         )
     )
     mae["mae_pp"] = mae["weighted_error_sum"] / mae["total_trades"] * 100  # in percentage points
@@ -209,11 +222,11 @@ def plot_calibration_curves(bucketed: pd.DataFrame) -> None:
     fig, ax = plt.subplots(figsize=(12, 7), facecolor="white")
 
     for regime in ["High", "Medium", "Low"]:
-        subset = bucketed[bucketed["volume_regime"] == regime].sort_values("bucket")
+        subset = bucketed[bucketed["volume_regime"] == regime].sort_values("avg_price_cents")
         if subset.empty:
             continue
         ax.plot(
-            subset["bucket"],
+            subset["avg_price_cents"],
             subset["win_rate"] * 100,
             marker="o",
             markersize=4,
@@ -296,7 +309,7 @@ def main() -> None:
 
     # Bucket and compute MAE
     bucketed = bucket_calibration(df, bucket_width=5)
-    mae_df = compute_mae(bucketed)
+    mae_df = compute_mae(df)
     print(f"  MAE by regime:\n{mae_df[['volume_regime', 'mae_pp']].to_string()}", file=sys.stderr)
 
     # Plot
@@ -335,10 +348,11 @@ def main() -> None:
     # Per-bucket detail for each regime
     summary["calibration_detail"] = {}
     for regime in ["Low", "Medium", "High"]:
-        subset = bucketed[bucketed["volume_regime"] == regime].sort_values("bucket")
+        subset = bucketed[bucketed["volume_regime"] == regime].sort_values("avg_price_cents")
         summary["calibration_detail"][regime] = [
             {
-                "bucket": float(r["bucket"]),
+                "bucket_mid": float(r["bucket_mid"]),
+                "avg_price_cents": round(float(r["avg_price_cents"]), 2),
                 "win_rate_pct": round(float(r["win_rate"]) * 100, 2),
                 "expected_pct": round(float(r["expected"]) * 100, 2),
                 "error_pp": round(float(r["abs_error"]) * 100, 2),

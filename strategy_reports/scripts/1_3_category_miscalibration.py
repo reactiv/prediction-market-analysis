@@ -12,7 +12,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import duckdb  # noqa: E402
 import pandas as pd  # noqa: E402
-import numpy as np  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -103,7 +102,8 @@ def load_data() -> pd.DataFrame:
         SELECT
             {CATEGORY_SQL} AS category,
             CASE WHEN t.taker_side = 'yes' THEN t.yes_price ELSE t.no_price END AS price,
-            CASE WHEN t.taker_side = m.result THEN 1 ELSE 0 END AS won
+            CASE WHEN t.taker_side = m.result THEN 1 ELSE 0 END AS won,
+            t.count AS contracts
         FROM '{TRADES_DIR}/*.parquet' t
         INNER JOIN resolved_markets m ON t.ticker = m.ticker
 
@@ -112,14 +112,16 @@ def load_data() -> pd.DataFrame:
         SELECT
             {CATEGORY_SQL} AS category,
             CASE WHEN t.taker_side = 'yes' THEN t.no_price ELSE t.yes_price END AS price,
-            CASE WHEN t.taker_side != m.result THEN 1 ELSE 0 END AS won
+            CASE WHEN t.taker_side != m.result THEN 1 ELSE 0 END AS won,
+            t.count AS contracts
         FROM '{TRADES_DIR}/*.parquet' t
         INNER JOIN resolved_markets m ON t.ticker = m.ticker
     )
     SELECT category, price,
-        COUNT(*) AS n,
-        SUM(won) AS wins,
-        100.0 * SUM(won) / COUNT(*) AS win_rate
+        COUNT(*) AS n_trades,
+        SUM(contracts) AS n_contracts,
+        SUM(won) AS wins_trades,
+        SUM(won * contracts) AS wins_contracts
     FROM all_positions
     WHERE price BETWEEN 1 AND 99
     GROUP BY category, price
@@ -137,39 +139,51 @@ def build_calibration(df: pd.DataFrame) -> pd.DataFrame:
     df["group"] = df["category"].apply(get_group)
     grouped = (
         df.groupby(["group", "price"], as_index=False)
-        .agg(n=("n", "sum"), wins=("wins", "sum"))
+        .agg(
+            n_trades=("n_trades", "sum"),
+            n_contracts=("n_contracts", "sum"),
+            wins_contracts=("wins_contracts", "sum"),
+        )
     )
-    grouped["win_rate"] = 100.0 * grouped["wins"] / grouped["n"]
+    grouped["win_rate"] = 100.0 * grouped["wins_contracts"] / grouped["n_contracts"]
     return grouped
 
 def bucket_calibration(df: pd.DataFrame, bucket_width: int = 5) -> pd.DataFrame:
     """Bucket prices into bins, enforce min 100 obs per bucket."""
     df = df.copy()
-    df["bucket"] = (df["price"] // bucket_width) * bucket_width + bucket_width / 2.0
+    df["bucket_mid"] = (df["price"] // bucket_width) * bucket_width + bucket_width / 2.0
+    df["price_contract_weighted"] = df["price"] * df["n_contracts"]
     agg = (
-        df.groupby(["group", "bucket"], as_index=False)
-        .agg(n=("n", "sum"), wins=("wins", "sum"))
-    )
-    agg["win_rate"] = 100.0 * agg["wins"] / agg["n"]
-    # Filter buckets with fewer than 100 observations
-    agg = agg[agg["n"] >= 100].copy()
-    return agg
-
-def compute_mae(bucketed: pd.DataFrame) -> pd.DataFrame:
-    """MAE = mean |win_rate - bucket_midpoint| per group."""
-    bucketed = bucketed.copy()
-    bucketed["abs_error"] = (bucketed["win_rate"] - bucketed["bucket"]).abs()
-    # Weight by number of observations in each bucket
-    bucketed["weighted_error"] = bucketed["abs_error"] * bucketed["n"]
-    mae = (
-        bucketed.groupby("group", as_index=False)
+        df.groupby(["group", "bucket_mid"], as_index=False)
         .agg(
-            total_n=("n", "sum"),
-            weighted_error_sum=("weighted_error", "sum"),
-            n_buckets=("bucket", "count"),
+            n_trades=("n_trades", "sum"),
+            n_contracts=("n_contracts", "sum"),
+            wins_contracts=("wins_contracts", "sum"),
+            price_contract_weighted=("price_contract_weighted", "sum"),
         )
     )
-    mae["mae"] = mae["weighted_error_sum"] / mae["total_n"]
+    agg["win_rate"] = 100.0 * agg["wins_contracts"] / agg["n_contracts"]
+    agg["avg_price"] = agg["price_contract_weighted"] / agg["n_contracts"]
+    agg["expected"] = agg["avg_price"]
+    agg["abs_error"] = (agg["win_rate"] - agg["expected"]).abs()
+    # Filter buckets with fewer than 100 observations
+    agg = agg[agg["n_trades"] >= 100].copy()
+    return agg
+
+def compute_mae(calibration: pd.DataFrame) -> pd.DataFrame:
+    """MAE = contract-weighted mean |win_rate(price) - price| per group."""
+    calibration = calibration.copy()
+    calibration["abs_error"] = (calibration["win_rate"] - calibration["price"]).abs()
+    calibration["weighted_error"] = calibration["abs_error"] * calibration["n_contracts"]
+    mae = (
+        calibration.groupby("group", as_index=False)
+        .agg(
+            total_contracts=("n_contracts", "sum"),
+            weighted_error_sum=("weighted_error", "sum"),
+            n_price_points=("price", "count"),
+        )
+    )
+    mae["mae"] = mae["weighted_error_sum"] / mae["total_contracts"]
     mae = mae.sort_values("mae", ascending=False).reset_index(drop=True)
     return mae
 
@@ -192,10 +206,10 @@ def plot_calibration_curves(bucketed: pd.DataFrame, top_groups: list[str]) -> No
     fig, ax = plt.subplots(figsize=(12, 7), facecolor="white")
 
     for i, grp in enumerate(top_groups):
-        subset = bucketed[bucketed["group"] == grp].sort_values("bucket")
+        subset = bucketed[bucketed["group"] == grp].sort_values("avg_price")
         color = COLORS[i % len(COLORS)]
         ax.plot(
-            subset["bucket"],
+            subset["avg_price"],
             subset["win_rate"],
             marker="o",
             markersize=4,
@@ -265,11 +279,12 @@ def main() -> None:
 
     cal = build_calibration(raw)
     bucketed = bucket_calibration(cal, bucket_width=5)
-    mae_df = compute_mae(bucketed)
+    mae_df = compute_mae(cal)
 
-    # Pick top 8 groups by total trade count
-    group_totals = cal.groupby("group")["n"].sum().sort_values(ascending=False)
-    top_groups = group_totals.head(8).index.tolist()
+    # Pick top 8 groups by contract volume
+    group_totals_contracts = cal.groupby("group")["n_contracts"].sum().sort_values(ascending=False)
+    group_totals_trades = cal.groupby("group")["n_trades"].sum().sort_values(ascending=False)
+    top_groups = group_totals_contracts.head(8).index.tolist()
     print(f"  Top 8 groups: {top_groups}", file=sys.stderr)
 
     # Filter bucketed to top 8 for plotting
@@ -286,12 +301,14 @@ def main() -> None:
     }
     for grp in top_groups:
         row = mae_df[mae_df["group"] == grp]
-        total_trades = int(group_totals.get(grp, 0))
+        total_contracts = int(group_totals_contracts.get(grp, 0))
+        total_trades = int(group_totals_trades.get(grp, 0))
         mae_val = float(row["mae"].iloc[0]) if len(row) > 0 else None
         summary["top_groups"].append({
             "group": grp,
             "mae_pp": round(mae_val, 2) if mae_val is not None else None,
             "total_trades": total_trades,
+            "total_contracts": total_contracts,
         })
 
     # Per-group bucket details for the most/least calibrated
@@ -303,21 +320,27 @@ def main() -> None:
     # Overall MAE (weighted by trades)
     top_mae = mae_df[mae_df["group"].isin(top_groups)]
     if len(top_mae) > 0:
-        overall = (top_mae["mae"] * top_mae["total_n"]).sum() / top_mae["total_n"].sum()
+        overall = (top_mae["mae"] * top_mae["total_contracts"]).sum() / top_mae["total_contracts"].sum()
         summary["overall_weighted_mae_pp"] = round(float(overall), 2)
 
     # Price-range analysis: where is miscalibration worst?
     bucketed_top_copy = bucketed_top.copy()
-    bucketed_top_copy["abs_error"] = (bucketed_top_copy["win_rate"] - bucketed_top_copy["bucket"]).abs()
+    bucketed_top_copy["weighted_error"] = bucketed_top_copy["abs_error"] * bucketed_top_copy["n_contracts"]
     range_summary = (
-        bucketed_top_copy.groupby("bucket")
-        .agg(mean_error=("abs_error", "mean"), total_n=("n", "sum"))
+        bucketed_top_copy.groupby("bucket_mid")
+        .agg(
+            weighted_error_sum=("weighted_error", "sum"),
+            total_contracts=("n_contracts", "sum"),
+        )
         .reset_index()
-        .sort_values("mean_error", ascending=False)
+    )
+    range_summary["mean_error"] = range_summary["weighted_error_sum"] / range_summary["total_contracts"]
+    range_summary = (
+        range_summary.sort_values("mean_error", ascending=False)
         .head(5)
     )
     summary["worst_price_ranges"] = [
-        {"bucket": float(r["bucket"]), "mean_error": round(float(r["mean_error"]), 2)}
+        {"bucket": float(r["bucket_mid"]), "mean_error": round(float(r["mean_error"]), 2)}
         for _, r in range_summary.iterrows()
     ]
 

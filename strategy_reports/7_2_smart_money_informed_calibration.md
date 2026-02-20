@@ -2,7 +2,7 @@
 
 ## Summary
 
-Smart money addresses on Polymarket earn their outsized returns primarily by exploiting the same calibration mispricings -- especially the longshot bias -- documented on Kalshi, but they do so with far greater precision and concentration than the typical market participant. The top 1% of Polymarket addresses average +35.0 pp excess return by systematically buying cheap tokens (avg 48.6 cents) that resolve favorably at an 83.6% rate, while Kalshi longshot contracts (below 15 cents) deliver -0.74 pp to undiscriminating buyers. This divergence suggests that the longshot mispricing is not a blanket feature of low-priced contracts but a selective opportunity: informed participants can distinguish which longshots are genuinely underpriced from which are overpriced lottery tickets, and a calibration strategy enhanced with smart-money flow data should outperform a naive fade-all-longshots approach.
+Smart money addresses on Polymarket earn their outsized returns primarily by exploiting the same calibration mispricings -- especially the longshot bias -- documented on Kalshi, but they do so with far greater precision and concentration than the typical market participant. The top 1% of Polymarket addresses average +35.0 pp excess return by systematically buying cheap tokens (avg 48.6 cents) that resolve favorably at an 83.6% rate, while Kalshi longshot contracts (below 15 cents) deliver -1.19 pp to undiscriminating buyers on a contract-weighted basis. This divergence suggests that the longshot mispricing is not a blanket feature of low-priced contracts but a selective opportunity: informed participants can distinguish which longshots are genuinely underpriced from which are overpriced lottery tickets, and a calibration strategy enhanced with smart-money flow data should outperform a naive fade-all-longshots approach.
 
 ## Component Signals
 
@@ -16,11 +16,11 @@ Critically, the top 20 addresses share a distinctive signature: they buy tokens 
 
 ### Signal 2: Longshot Bias (from §1.1)
 
-Kalshi markets exhibit a classic longshot bias: every price point from 1 to 14 cents has negative excess returns for buyers, with a trade-weighted average of -0.74 pp across 19 million trades. The bias peaks at 7-9 cents (-1.2 pp) and is mirrored symmetrically by favorite underpricing above 85 cents (+0.75 pp).
+Kalshi markets exhibit a classic longshot bias: every price point from 1 to 14 cents has negative excess returns for buyers, with a contract-weighted average of -1.19 pp across 6.17 billion contracts (trade-weighted: -0.74 pp across 19 million trades). The bias peaks in the 5-14c region and is mirrored symmetrically by favorite underpricing above 85 cents (+1.20 pp contract-weighted).
 
-A naive fade-longshot strategy (selling YES below 15 cents) earns 0.74 cents per contract with a 93.87% win rate -- a statistically robust but economically small edge that amounts to roughly 0.79% return on capital per trade. The bias is concentrated in the 5-14 cent range; the very cheapest contracts (0-5 cents) show smaller mispricing (-0.44 pp), possibly because they are priced low enough to partially compensate for the bias.
+A naive fade-longshot strategy (selling YES below 15 cents) earns 1.19 cents per contract with a 95.2% win rate -- a statistically robust but still execution-sensitive edge that amounts to roughly 1.27% gross return on capital per trade. The bias is concentrated in the 5-14 cent range; the very cheapest contracts (0-5 cents) show smaller mispricing (-0.60 pp contract-weighted).
 
-**Key metric:** Aggregate longshot buyers lose -0.74 pp, but smart money on Polymarket earns +35.0 pp buying in similar price ranges, implying the aggregate bias conceals a mixture of severely overpriced and genuinely underpriced longshots.
+**Key metric:** Aggregate longshot buyers lose -1.19 pp, but smart money on Polymarket earns +35.0 pp buying in similar price ranges, implying the aggregate bias conceals a mixture of severely overpriced and genuinely underpriced longshots.
 
 ### Signal 3: Whale Activity (from §5.2)
 
@@ -42,11 +42,11 @@ Retail's -6.88 pp excess return and 22.4% win rate against a 29.3% average purch
 
 ### Do Smart Money Addresses Exploit Longshot Markets?
 
-The evidence strongly suggests yes, but with crucial selectivity. The top Polymarket addresses (§5.1) earn their highest returns by buying tokens at 2-9 cents -- precisely the price range where the Kalshi longshot bias (§1.1) is most pronounced (peak mispricing at 7-9 cents). However, the *direction* of their edge is opposite to what the aggregate bias would predict. The aggregate longshot buyer loses money (Kalshi: -0.74 pp across the longshot zone; Polymarket Retail: -6.88 pp), but smart money earns enormous returns in the same zone. This implies:
+The evidence strongly suggests yes, but with crucial selectivity. The top Polymarket addresses (§5.1) earn their highest returns by buying tokens at 2-9 cents -- precisely the price range where the Kalshi longshot bias (§1.1) is most pronounced. However, the *direction* of their edge is opposite to what the aggregate bias would predict. The aggregate longshot buyer loses money (Kalshi: -1.19 pp across the longshot zone; Polymarket Retail: -6.88 pp), but smart money earns enormous returns in the same zone. This implies:
 
 1. **The longshot zone is a mixture distribution.** Some longshot contracts are genuinely overpriced (the majority, creating the aggregate bias), while a minority are severely underpriced. Smart money identifies and concentrates in the underpriced tail.
 2. **The aggregate bias is a necessary condition for smart money profits.** If all longshots were correctly priced, there would be no edge on either side. The persistent overpricing of most longshots creates a pool of counterparties (retail buyers of overpriced longshots) who subsidize the informed traders who cherry-pick the underpriced ones.
-3. **Smart money does not simply "fade longshots" -- they selectively buy them.** The naive Kalshi strategy of shorting all longshots earns 0.74 cents per contract. Smart money earns orders of magnitude more by identifying *which* longshots to buy.
+3. **Smart money does not simply \"fade longshots\" -- they selectively buy them.** The naive Kalshi strategy of shorting all longshots earns 1.19 cents per contract. Smart money earns orders of magnitude more by identifying *which* longshots to buy.
 
 ### Do Whales Differ from Smart Money?
 
@@ -70,7 +70,7 @@ A combined Smart-Money-Informed Calibration strategy would layer Polymarket beha
 
 ### Step 1: Establish the Base Calibration Edge (from §1.1)
 
-Begin with the Kalshi longshot bias as a prior: contracts priced at 5-14 cents are overpriced by 0.74-1.63 pp on average. This provides a baseline edge of approximately 0.79% return on capital per trade for a blanket fade-longshot approach.
+Begin with the Kalshi longshot bias as a prior: contracts priced at 5-14 cents are overpriced by about 1.67 pp in aggregate bucketed estimates, with a full-zone contract-weighted edge of 1.19 pp. This provides a baseline edge of approximately 1.27% gross return on capital per trade for a blanket fade-longshot approach.
 
 ### Step 2: Cross-Reference with Polymarket Smart Money Flow (from §5.1)
 
@@ -100,7 +100,7 @@ Market Maker directional positions provide a secondary confirmation signal. If M
 
 ### Expected Edge Enhancement
 
-The naive fade-longshot strategy earns 0.74 cents per contract on Kalshi. By filtering out the longshot contracts where Polymarket smart money has identified genuine value, the strategy avoids the tail losses from shorting correctly-priced or underpriced longshots. Conservative estimates suggest this filtering could improve the per-trade edge by 20-50% (to approximately 0.9-1.1 cents per contract) while reducing the variance of the strategy, as the 6% loss rate on the naive fade is disproportionately concentrated in contracts where informed traders were on the other side.
+The naive fade-longshot strategy earns 1.19 cents per contract on Kalshi. By filtering out the longshot contracts where Polymarket smart money has identified genuine value, the strategy avoids the tail losses from shorting correctly-priced or underpriced longshots. Conservative estimates suggest this filtering could improve the per-trade edge by 20-50% (to approximately 1.4-1.8 cents per contract) while reducing strategy variance, as the loss tail on the naive fade is disproportionately concentrated in contracts where informed traders were on the other side.
 
 ## Key Recommendations
 
@@ -124,4 +124,4 @@ The naive fade-longshot strategy earns 0.74 cents per contract on Kalshi. By fil
 
 - **Aggregate vs. selective edge ambiguity.** The synthesis assumes smart money selectively buys underpriced longshots while avoiding overpriced ones. This is inferred from the coexistence of smart money profits and aggregate longshot losses, but the mechanism has not been directly tested. It is possible that smart money profits come from entirely different market segments (e.g., mid-range contracts) and the longshot connection is coincidental.
 
-- **No fee or execution modeling.** All excess return figures are gross of fees. Kalshi charges fees on trades and settlements; Polymarket has trading fees and gas costs. The 0.74 pp base edge from fading longshots on Kalshi may be partially or fully consumed by transaction costs, and the incremental improvement from smart money filtering must exceed any additional monitoring and execution costs to be net profitable.
+- **No fee or execution modeling.** All excess return figures are gross of fees. Kalshi charges fees on trades and settlements; Polymarket has trading fees and gas costs. The 1.19 pp base edge from fading longshots on Kalshi may be partially consumed by transaction costs, and the incremental improvement from smart money filtering must exceed any additional monitoring and execution costs to be net profitable.

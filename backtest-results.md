@@ -52,36 +52,36 @@ Small frequent wins vs rare catastrophic losses. The strategy works because the 
 
 ## 2. Calibration Surface Strategy
 
-Uses T6 rolling calibration features (7-day rolling MAE by category) to filter trades. Hypothesis: selecting trades in categories with high historical mispricing should improve returns.
+Uses T6 rolling calibration features (7-day rolling MAE by `(category, price_bucket, tte_bucket, taker_side)`) to filter trades. Hypothesis: selecting trades in high historical mispricing cells should improve returns.
 
 ### 2.1 Threshold Sweep (< 15c, NO side, 7-day lag)
 
 | MAE Threshold | Trades | Win Rate | Avg Return | Sharpe | Profit Factor |
 |--------------:|-------:|--------:|-----------:|-------:|--------------:|
 | No filter | 7.45M | 94.46% | **+1.13c** | **0.050** | **1.503** |
-| 1pp | 5.25M | 93.89% | +0.67c | 0.029 | 1.214 |
-| 3pp | 5.18M | 93.84% | +0.67c | 0.028 | 1.203 |
-| 5pp | 5.01M | 93.72% | +0.62c | 0.026 | 1.184 |
-| 8pp | 4.53M | 93.53% | +0.50c | 0.021 | 1.148 |
-| 10pp | 3.95M | 93.30% | +0.34c | 0.014 | 1.107 |
-| 15pp | 1.92M | 92.94% | +0.03c | 0.001 | 1.037 |
-| 20pp | 0.76M | 92.31% | -0.60c | -0.023 | 0.932 |
+| 1pp | 3.32M | 92.15% | +0.28c | 0.011 | 1.157 |
+| 3pp | 2.90M | 91.38% | +0.04c | 0.001 | 1.102 |
+| 5pp | 2.03M | 90.07% | -0.47c | -0.016 | 1.033 |
+| 8pp | 1.42M | 89.28% | -0.74c | -0.024 | 1.019 |
+| 10pp | 0.93M | 89.89% | -0.31c | -0.010 | 1.127 |
+| 15pp | 0.49M | 89.55% | -0.58c | -0.019 | 1.124 |
+| 20pp | 0.28M | 89.12% | -1.29c | -0.042 | 1.028 |
 
 ### 2.2 Finding: MAE Filtering is Counter-Productive
 
-**Higher MAE thresholds monotonically decrease performance.** The unfiltered fade-longshot outperforms every calibration-filtered variant. Two factors:
+**MAE filtering remains counter-productive.** The unfiltered fade-longshot still outperforms every calibration-filtered variant. Performance degrades sharply once thresholds exceed 3pp. Two factors:
 
-1. **The INNER JOIN loses ~30% of trades** (7.45M to 5.25M at 1pp). These are trades in (category, price, tte) cells without sufficient T6 history --- and they're profitable trades being excluded.
+1. **The INNER JOIN now loses ~55% of trades** (7.45M to 3.32M at 1pp). These are trades in cells without sufficient T6 history and are disproportionately profitable in aggregate.
 
-2. **High MAE selects unusual categories**, not persistently mispriced ones. Categories with high 7-day MAE tend to be those experiencing one-off events (elections, breaking news) where past mispricing doesn't predict future returns.
+2. **High MAE selects unstable cells**, not reliably mispriced ones. Elevated rolling MAE often appears in sparse or event-driven regimes where past error does not transfer cleanly forward.
 
 ### 2.3 Broader Price Range (< 50c)
 
 | MAE Threshold | Trades | Win Rate | Avg Return | Sharpe |
 |--------------:|-------:|--------:|-----------:|-------:|
-| 3pp | 19.3M | 75.3% | -0.47c | -0.011 |
-| 5pp | 19.0M | 75.1% | -0.49c | -0.012 |
-| 10pp | 16.2M | 74.4% | -0.57c | -0.014 |
+| 3pp | 15.5M | 72.3% | -1.07c | -0.025 |
+| 5pp | 14.4M | 71.1% | -1.21c | -0.028 |
+| 10pp | 11.6M | 69.6% | -1.10c | -0.025 |
 
 **Buying NO above ~20c is unprofitable.** At mid-range prices (30--50c), the NO side costs 50--70c but only wins ~60--70% of the time. After the large losses on the 30--40% losing trades and fees, the net return is negative. The longshot bias is a tail phenomenon, not a broad market inefficiency.
 
@@ -253,4 +253,4 @@ For a $100,000 bankroll (= 10M cents): max position multiplier = 0.20 * 10M / 18
 - **Max drawdown**: Computed via cumulative PnL with deterministic ordering (timestamp, trade_id).
 - **Monte Carlo**: 10,000 paths, 100K trades each, bootstrap with replacement from empirical return distribution.
 - **Kelly**: Binary Kelly `f* = (pb - q) / b`, uncertainty-adjusted by `(1 - CV_edge)` from Monte Carlo.
-- **Look-ahead caveat**: The calibration surface strategy uses T6 features with a 7-day lag. T6 win_rates incorporate eventual resolution outcomes, so some residual forward-looking bias may remain for markets resolving >7 days after trade date. This does not affect the fade-longshot strategies which use no calibration signal.
+- **Calibration-surface update (2026-02-19)**: Section 2 metrics were recomputed after patching T6 to use resolution-date feature indexing and side-aware cell granularity `(category, price_bucket, tte_bucket, taker_side)`, with strategy joins on `taker_side` and a 7-day lag.

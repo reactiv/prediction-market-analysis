@@ -203,25 +203,25 @@ The top tercile accounts for 98.1% of all trades. Polymarket has similar concent
 
 ## T6: Rolling Calibration Scores as Real-Time Features
 
-**Status:** `[x]` Complete — completed 2026-02-17 (1,467,564 daily feature rows, regime flags, resolution lag stats)
+**Status:** `[x]` Complete — completed 2026-02-19 (1,216,883 daily feature rows, regime flags, resolution lag stats)
 
-**What:** Compute rolling N-day calibration MAE per category, per volume regime, and per time-to-expiry bucket. Store as time-indexed features suitable for use as inputs to a trading model.
+**What:** Compute rolling N-day calibration MAE per `(category, price_bucket, time-to-expiry bucket, taker_side)` cell. Feature dates are indexed by market resolution day (`close_time`) to keep labels causal. Store as time-indexed features suitable for use as inputs to a trading model.
 
-**Sparsity sensitivity:** **Low.** This aggregates across all markets within a category over a time window, so individual market sparsity is irrelevant — a 30-day window across all Sports markets contains millions of trades. The real constraint is **resolution lag**: calibration can only be computed from trades on already-resolved markets. The rolling score inherently overweights short-duration markets (which resolve quickly) and underrepresents long-dated markets that are still active. This is a bias to document, not a blocker.
+**Sparsity sensitivity:** **Moderate.** The transform runs at cell-level granularity (not just category-level), so sparse cells can be noisy. The real structural constraint remains **resolution lag**: calibration can only be computed from trades on already-resolved markets. Resolution-day indexing avoids look-ahead but still overweights shorter-duration markets that resolve quickly.
 
 **Input data:**
 - Kalshi: `data/kalshi/trades/*.parquet` joined with `data/kalshi/markets/*.parquet` (same join as §1.1–1.4)
 
 **Transform steps:**
 - [x] For each resolved trade, record (trade_timestamp, resolution_timestamp, category, price_bucket, taker_side, won)
-- [x] Compute rolling 7-day, 30-day, 90-day calibration MAE per category, using only trades whose *resolution* falls within the trailing window (not trade timestamp — this avoids look-ahead bias)
-- [x] Compute rolling MAE per time-to-expiry bucket (using time-to-expiry at trade time)
-- [x] Compute rolling YES/NO taker ratio per category (from §6.3)
+- [x] Compute rolling 7-day, 30-day, 90-day calibration MAE per `(category, price_bucket, tte_bucket, taker_side)` cell, indexed by resolution day (`close_time`) to avoid look-ahead bias
+- [x] Compute rolling MAE and opportunity signals at full cell granularity (not category-only pooling)
+- [x] Compute rolling YES-share signal (`yes_ratio_7d`) within each cell
 - [ ] Compute rolling maker/taker excess return gap per category (from §2.1)
-- [x] Build composite "opportunity score" = f(rolling_MAE, YES_bias, maker_gap) per category
-- [x] Flag regime transitions: detect when rolling MAE crosses threshold (e.g., >2x trailing 90-day median → "shock" regime, as in §1.4 election spike)
+- [x] Build composite "opportunity score" = `mae_7d * log1p(volume_7d) * (1 + abs(yes_ratio_7d - 0.5))` per cell
+- [x] Flag regime transitions when `mae_7d` crosses `mae_90d` per cell
 - [x] Document resolution lag bias: report median resolution delay per category and the effective "freshness" of each rolling window
-- [x] Output: daily feature table (date, category, rolling_MAE_7d, rolling_MAE_30d, rolling_MAE_90d, YES_bias_ratio, maker_gap, opportunity_score, regime_flag, median_resolution_lag_days)
+- [x] Output: daily feature table (`trade_date`, `category`, `price_bucket`, `tte_bucket`, `taker_side`, `mae_7d`, `mae_30d`, `mae_90d`, `opportunity_score`) plus per-cell regime flags and per-category resolution-lag summary
 
 **Unlocks:**
 - Real-time regime detection (addresses the stationarity limitations flagged in nearly every report)
@@ -337,7 +337,7 @@ T6 (Rolling Calibration) ──> standalone (core uses only trades + resolved ma
 | **T3** Position Ledger | **Low** | Address-centric aggregation across many markets; binary resolution sidesteps intermediate price staleness |
 | **T4** Implied Surfaces | Moderate | Cross-sectional fits work well; temporal evolution restricted to top 4 liquid families |
 | **T5** Lead-Lag Network | **Severe** | Scoped to ~20 curated liquid pairs as a case study, not a broad network |
-| **T6** Rolling Calibration | **Low** | Category-level pooling handles sparsity; resolution lag is the real constraint, documented explicitly |
+| **T6** Rolling Calibration | **Moderate** | Cell-level rolling (category × price × tte × side) is richer but noisier; resolution lag remains the key structural constraint |
 | **T7** Address Graph | Mixed | Structural graph (co-occurrence) robust; temporal patterns (Sybil, cascades) restricted to liquid markets |
 | **T8** Lifecycle States | Moderate, self-selecting | Sparse markets collapse to trivial state paths, which doubles as a tradability filter |
 
@@ -347,7 +347,7 @@ T6 (Rolling Calibration) ──> standalone (core uses only trades + resolved ma
 |----------|-----------|--------|-----------|
 | 1 | **T1** Trade Enrichment + OHLCV | ✅ Done | Foundational — Layer A feeds T2 and T8; Layer B feeds T5 and T7 temporal |
 | 2 | **T3** Position Ledger | ✅ Done | Upgrades the entire Family 5 smart money analysis from static to dynamic; naturally sparsity-robust |
-| 3 | **T6** Rolling Calibration | ✅ Done | Cheapest to compute, most immediately actionable as trading features; sparsity-robust via category pooling |
+| 3 | **T6** Rolling Calibration | ✅ Done | Immediately actionable feature surface with causal indexing; strongest when paired with minimum-cell-liquidity filters |
 | 4 | **T2** Order Flow / Price Impact | ❌ Not started | Highest value for live trading — enables real-time toxicity and execution modeling |
 | 5 | **T4** Implied Surfaces | ❌ Not started | Largest analytical upgrade for threshold arbitrage in §4.3 and §7.3 |
 | 6 | **T8** Lifecycle State Machine | ✅ Done | Makes §3.3 findings tradable without look-ahead; doubles as tradability filter |
